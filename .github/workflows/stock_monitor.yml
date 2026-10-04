@@ -1,49 +1,52 @@
-name: Taiwan Stock Breakout Monitor
+name: Manual Trading Signal Monitor
 
 on:
   schedule:
-    # 台灣時區 (UTC+8) 週一至週五 11:30、13:45 執行
-    # 對應 UTC 時間為 03:30, 05:45
-    - cron: '30 3 * * 1-5'
-    - cron: '45 5 * * 1-5'
-  workflow_dispatch: # 支援在 GitHub 網頁手動點擊測試
+    # 台灣時區 (UTC+8) 週一至週五：
+    # 09:15 ~ 10:30 每 15 分鐘一次 (UTC 01:15 ~ 02:30)
+    - cron: '15,30,45 1 * * 1-5'
+    - cron: '0,15,30 2 * * 1-5'
+    # 11:30 ~ 12:30 突破區間 (UTC 03:30 ~ 04:30)
+    - cron: '30,45 3 * * 1-5'
+    - cron: '0,15,30 4 * * 1-5'
+    # 13:30 收盤結算與月底檢查 (UTC 05:30)
+    - cron: '30 5 * * 1-5'
+  workflow_dispatch:
 
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 賦予推回資料庫的權限
+      contents: write
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
 
       - name: Install Dependencies
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests pandas python-dateutil pytz
 
-      - name: Run Stock Breakout Engine
+      - name: Run Scan & Alert
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python main.py
 
-      - name: Commit and Push Data
+      - name: Commit Historical Records
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action Bot"
+          git config --local user.email "bot@action.com"
+          git config --local user.name "SignalBot"
           git add data/history/*.csv || true
           if git diff --staged --quiet; then
-            echo "No data changes to commit."
+            echo "No new signals."
           else
-            git commit -m "Auto-update market signal data [skip ci]"
+            git commit -m "Add manual trading signal log [skip ci]"
             git push
           fi
