@@ -1,8 +1,9 @@
 import asyncio
-import logging
-import re
 from dataclasses import dataclass
 from datetime import datetime
+import logging
+import os
+import re
 from typing import Dict, Optional
 from telegram import Update
 from telegram.constants import ParseMode
@@ -21,7 +22,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ================= 機器人 Token 設定 =================
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # 請替換為您的 Bot Token
+# 自動從環境變數讀取，若本地測試未設環境變數，也可將引號內改為實際 Token
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # ====================================================
 
 
@@ -53,7 +55,6 @@ class BreakoutEvaluator:
     def parse_signal_text(self, text: str) -> Optional[BreakoutSignal]:
         """精準解析當沖推播訊息"""
         try:
-            # 支援如 "聯茂 (6213.TW)" 或純 "6213"
             symbol_m = re.search(r"([0-9]{4}(?:\.TW)?)", text)
             price_m = re.search(r"現價[：:]\s*([0-9.]+)", text)
             high_15m_m = re.search(r"首15分高[：:]\s*([0-9.]+)", text)
@@ -149,7 +150,7 @@ class BreakoutEvaluator:
             score -= 20
             alerts.append(f"⚠️ 已脫離突破點 +{breakout_pct:.2f}%，追價風報比不佳")
 
-        # 5. 精準防守點計算 (改採首15分高點下 2 個 tick 防守，避免深幅虧損)
+        # 5. 精準防守點計算 (採首15分高點下 2 個 tick 防守)
         tight_sl = round(sig.high_15m * 0.998, 1)
         tight_risk = sig.price - tight_sl
         reward = sig.tp - sig.price
@@ -195,19 +196,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text
 
-    # 快速篩選關鍵字，避免浪費資源解析普通閒聊訊息
+    # 快速關鍵字快篩
     if "當沖進場訊號" not in text and "放量突破" not in text:
         return
 
-    # 解析訊息
     sig = evaluator.parse_signal_text(text)
     if not sig:
         return
 
-    # 執行過濾評估
     res = evaluator.evaluate(sig)
 
-    # 組合卡片文字
     alerts_text = (
         "\n".join([f"  • {a}" for a in res["alerts"]])
         if res["alerts"]
@@ -232,7 +230,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━"
     )
 
-    # 引用原訊號直接回覆
     await update.message.reply_text(
         text=reply_message,
         parse_mode=ParseMode.HTML,
@@ -241,10 +238,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    if not BOT_TOKEN:
+        print("錯誤：未偵測到 TELEGRAM_BOT_TOKEN，請確認環境變數已設定。")
+        return
+
     print("啟動 Telegram 當沖過濾守門員機器人中...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # 監聽文字訊息
     app.add_handler(
         MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
     )
