@@ -1,3 +1,3 @@
-﻿date,time,code,name,price,pct_change,volume,stop_loss,target_price,link
-2026-10-05,15:00:42,2330,台積電,2575.0,3.0,23926,2545.0,2635.0,https://tw.stock.yahoo.com/quote/2330
-2026-10-05,15:00:42,2454,聯發科,5165.0,4.34,6752,5051.37,5392.26,https://tw.stock.yahoo.com/quote/2454
+﻿signal_id,strategy,date,time,market,code,name,price,pct_change,volume,stop_loss,target_price,wave,day_high_at_signal,day_low_at_signal,extra_info,link
+2026-10-05_15:00:42_2330_None,,2026-10-05,15:00:42,tse,2330,台積電,2575.0,3.0,23926,2545.0,2635.0,,,,,https://tw.stock.yahoo.com/quote/2330
+2026-10-05_15:00:42_2454_None,,2026-10-05,15:00:42,tse,2454,聯發科,5165.0,4.34,6752,5051.37,5392.26,,,,,https://tw.stock.yahoo.com/quote/2454
