@@ -1,255 +1,1191 @@
-import asyncio
-from dataclasses import dataclass
-from datetime import datetime
-import logging
+# -*- coding: utf-8 -*-
+"""
+台股當沖訊號機器人 v4 (小哥體系轉折與動能竭盡精準版)
+
+核心優化亮點:
+  1. 波動壓縮後噴發 (Squeeze Breakout): 識別「長時間盤整窄幅壓縮後的首度突破」，避開高檔洗盤。
+  2. VWAP 量加權均價線與通道高低位: 嚴格過濾正乖離 > 2.2% 的過熱追高陷阱。
+  3. 大盤加權指數 (tse_t00.tw) 多空共振濾網: 盤面轉弱時嚴格禁止做多突破。
+  4. 避開垃圾洗盤時段: 10:30 ~ 11:20 流動性真空期禁止開新倉。
+  5. 獨創「主力熄燈 / 動能竭盡」出場提醒:
+     對盤中已持有的部位，當偵測到「賣一巨單壓頂 + 委買比率潰散 + 衝高拉回」時，
+     立即發送 Telegram 轉折警告，提示交易員提早獲利落袋或保本出場！
+  6. 完整結果追蹤、保本停損推升、R倍數損益結算與每日/月度勝率統計覆盤。
+
+用法:
+  python daytrade_bot.py                 單次執行 (Cron / GitHub Actions)
+  python daytrade_bot.py --loop          常駐輪詢 (推薦, 本機/VPS, 間隔 15 秒)
+  python daytrade_bot.py --report        輸出累計勝率/期望值報告 (--days 30, --send 同步推播)
+  python daytrade_bot.py --finalize      手動結算今日或指定日期 (--finalize 2026-10-21)
+  python daytrade_bot.py --build-watchlist 立即建立明日作戰清單
+  python daytrade_bot.py --check-api     檢查資料來源與欄位是否正常
+"""
 import os
-import re
-from typing import Dict, Optional
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+import sys
+import csv
+import json
+import math
+import time
+import html
+import shutil
+import argparse
+import traceback
+from datetime import datetime, date, time as dtime, timedelta
 
-# 1. 啟用日誌記錄
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+import pandas as pd
+import pytz
+import requests
 
-# ================= 機器人 Token 設定 =================
-# 自動從環境變數讀取，若本地測試未設環境變數，也可將引號內改為實際 Token
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-# ====================================================
+TW_TZ = pytz.timezone("Asia/Taipei")
+
+# ==================== 設定 ====================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+DATA_DIR = os.getenv("DATA_DIR", "data/history")
+SIGNALS_FILE = os.path.join(DATA_DIR, "signals_history.csv")
+RESULTS_FILE = os.path.join(DATA_DIR, "signals_results.csv")
+STATE_FILE = os.path.join(DATA_DIR, "open_positions.json")
+WATCHLIST_FILE = os.path.join(DATA_DIR, "tomorrow_watchlist.json")
+FLAGS_FILE = os.path.join(DATA_DIR, "daily_flags.json")
+
+# 交易成本設定
+FEE_RATE = 0.001425
+FEE_DISCOUNT = float(os.getenv("FEE_DISCOUNT", "0.6"))
+DAYTRADE_TAX = float(os.getenv("DAYTRADE_TAX", "0.0015"))
+SLIPPAGE = float(os.getenv("SLIPPAGE", "0.0005"))
+
+# 選股條件
+MIN_PRICE = 25.0
+MIN_LOTS = 2000
+MIN_AMPLITUDE_PCT = 3.0          # 前一日振幅門檻
+WATCHLIST_SIZE = 30
+DAYTRADE_RATIO_MAX = 45.0        # 當沖比 >= 此值視為過熱
+
+# 乖離與停損設定
+MAX_VWAP_BIAS = 2.2              # 正乖離大於 2.2% 視為過熱力竭, 嚴禁追高
+MIN_RISK_RUSH = 0.008
+MIN_RISK_TREND = 0.010
+
+UA = {"User-Agent": "Mozilla/5.0 (compatible; daytrade-bot/4.0)"}
+TWSE_DAY_ALL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+TWSE_NOTICE = "https://openapi.twse.com.tw/v1/announcement/notice"
+TWSE_DAYTRADE_LIST = "https://openapi.twse.com.tw/v1/exchangeReport/TWTB4U"
+TWSE_DAYTRADE_STATS = "https://www.twse.com.tw/rwd/zh/dayTrading/TWTB4U"
+TPEX_DAY_ALL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+
+INDEX_SYMBOL = "tse_t00.tw"
+FALLBACK_WATCH = ["tse_2330.tw", "tse_2317.tw", "tse_2454.tw", "tse_3231.tw", "tse_2382.tw"]
+
+SIGNAL_COLUMNS = [
+    "signal_id", "strategy", "date", "time", "market", "code", "name", "price", "pct_change",
+    "vwap", "vwap_bias", "volume", "stop_loss", "target_price", "wave", "day_high_at_signal",
+    "day_low_at_signal", "extra_info", "link",
+]
+RESULT_COLUMNS = [
+    "signal_id", "date", "time", "strategy", "market", "code", "name", "entry", "stop", "target",
+    "outcome", "exit_price", "gross_pct", "cost_pct", "net_pct", "risk_pct", "r_multiple",
+    "touched_target", "touched_stop", "first_touch", "close_price", "note",
+]
 
 
-@dataclass
-class BreakoutSignal:
-    symbol: str
-    price: float
-    high_15m: float
-    volume: int
-    rvol: float
-    vwap: float
-    sl: float
-    tp: float
-    time_str: str
+# ==================== 基礎工具 ====================
+def now_tw():
+    return datetime.now(TW_TZ)
 
 
-class BreakoutEvaluator:
+def log(msg):
+    print(f"[{now_tw():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
-    def __init__(
-        self,
-        min_rvol: float = 1.8,
-        max_rvol: float = 4.8,
-        max_vwap_bias: float = 3.0,
-    ):
-        self.min_rvol = min_rvol
-        self.max_rvol = max_rvol
-        self.max_vwap_bias = max_vwap_bias
 
-    def parse_signal_text(self, text: str) -> Optional[BreakoutSignal]:
-        """精準解析當沖推播訊息"""
+def esc(x):
+    return html.escape(str(x), quote=True)
+
+
+def to_float(v, default=None):
+    try:
+        s = str(v).replace(",", "").strip()
+        if s in ("", "-", "--"):
+            return default
+        return float(s)
+    except (ValueError, TypeError):
+        return default
+
+
+def pick(d, *keys):
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return None
+
+
+def roc_to_date(s):
+    s = str(s or "").strip()
+    try:
+        if "/" in s:
+            y, m, d = s.split("/")
+            y = int(y)
+            return date(y + 1911 if y < 1911 else y, int(m), int(d))
+        if s.isdigit() and len(s) == 7:
+            return date(int(s[:3]) + 1911, int(s[3:5]), int(s[5:7]))
+        if s.isdigit() and len(s) == 8:
+            return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+    except ValueError:
+        pass
+    return None
+
+
+def tick_size(price):
+    if price < 10:
+        return 0.01
+    if price < 50:
+        return 0.05
+    if price < 100:
+        return 0.1
+    if price < 500:
+        return 0.5
+    if price < 1000:
+        return 1.0
+    return 5.0
+
+
+def round_tick(price, direction="nearest"):
+    tk = tick_size(price)
+    n = price / tk
+    if direction == "up":
+        n = math.ceil(n - 1e-9)
+    elif direction == "down":
+        n = math.floor(n + 1e-9)
+    else:
+        n = round(n)
+    return round(n * tk, 2)
+
+
+def load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        log(f"[Error] 讀取 {path} 失敗: {e}")
+        return default
+
+
+def save_json(path, obj):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def flag_done(name, day):
+    return bool(load_json(FLAGS_FILE, {}).get(day, {}).get(name))
+
+
+def mark_done(name, day):
+    flags = load_json(FLAGS_FILE, {})
+    flags.setdefault(day, {})[name] = True
+    cutoff = (now_tw().date() - timedelta(days=14)).isoformat()
+    save_json(FLAGS_FILE, {k: v for k, v in flags.items() if k >= cutoff})
+
+
+# ==================== Telegram 推播 ====================
+def send_telegram_message(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("[Warn] 未設定 Telegram 參數, 訊息僅輸出至終端機:\n" + message)
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    chunks, cur = [], ""
+    for line in message.split("\n"):
+        if len(cur) + len(line) + 1 > 3800:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        chunks.append(cur)
+    ok = True
+    for c in chunks:
         try:
-            symbol_m = re.search(r"([0-9]{4}(?:\.TW)?)", text)
-            price_m = re.search(r"現價[：:]\s*([0-9.]+)", text)
-            high_15m_m = re.search(r"首15分高[：:]\s*([0-9.]+)", text)
-            vol_m = re.search(r"量能[：:]\s*([0-9]+)", text)
-            rvol_m = re.search(r"相對量能\s*([0-9.]+)x", text)
-            vwap_m = re.search(r"VWAP[：:]\s*([0-9.]+)", text)
-            sl_m = re.search(r"停損[：:]\s*([0-9.]+)", text)
-            tp_m = re.search(r"停利[：:]\s*([0-9.]+)", text)
-            time_m = re.search(r"時間[：:]\s*([0-9]{2}:[0-9]{2}:[0-9]{2})", text)
-
-            if not all(
-                [
-                    symbol_m,
-                    price_m,
-                    high_15m_m,
-                    vol_m,
-                    rvol_m,
-                    vwap_m,
-                    sl_m,
-                    tp_m,
-                    time_m,
-                ]
-            ):
-                return None
-
-            return BreakoutSignal(
-                symbol=symbol_m.group(1),
-                price=float(price_m.group(1)),
-                high_15m=float(high_15m_m.group(1)),
-                volume=int(vol_m.group(1)),
-                rvol=float(rvol_m.group(1)),
-                vwap=float(vwap_m.group(1)),
-                sl=float(sl_m.group(1)),
-                tp=float(tp_m.group(1)),
-                time_str=time_m.group(1),
+            r = requests.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": c,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+                timeout=10,
             )
+            if not r.ok:
+                log(f"[Error] Telegram 回應 {r.status_code}: {r.text[:200]}")
+                ok = False
         except Exception as e:
-            logger.error(f"解析訊號字串時發生錯誤: {e}")
-            return None
+            log(f"[Error] Telegram 推播失敗: {e}")
+            ok = False
+    return ok
 
-    def evaluate(self, sig: BreakoutSignal) -> Dict:
-        """多維度量化過濾與動態風控計算"""
-        score = 100
-        alerts = []
 
-        # 1. VWAP 乖離率檢驗
-        vwap_bias = (sig.price - sig.vwap) / sig.vwap * 100
-        if sig.price < sig.vwap:
-            score -= 60
-            alerts.append("❌ 現價跌破 VWAP 成本線，多方動能喪失")
-        elif vwap_bias > 3.5:
-            score -= 30
-            alerts.append(f"⚠️ 現價距 VWAP +{vwap_bias:.2f}%，乖離過大防拉回急殺")
-        elif vwap_bias > 2.5:
-            score -= 10
-            alerts.append(f"ℹ️ 乖離偏大 (+{vwap_bias:.2f}%)，避免市價單追價")
+def alert_once(key, text):
+    log(f"[Alert] {text}")
+    day = now_tw().strftime("%Y-%m-%d")
+    if not flag_done("alert:" + key, day):
+        send_telegram_message(f"⚠️ <b>系統警示</b>\n{esc(text)}")
+        mark_done("alert:" + key, day)
 
-        # 2. 相對量能 (RVOL) 甜點區過濾
-        if sig.rvol < self.min_rvol:
-            score -= 40
-            alerts.append(f"❌ RVOL {sig.rvol}x 動能偏弱，高度疑為假突破")
-        elif sig.rvol > 7.0:
-            score -= 35
-            alerts.append(f"⚠️ RVOL {sig.rvol}x 爆量過熱，嚴防力竭或主力倒貨")
-        elif sig.rvol > self.max_rvol:
-            score -= 15
-            alerts.append(f"ℹ️ RVOL {sig.rvol}x 略顯過熱，建議等待回測確認")
 
-        # 3. 時間窗口效益 (過濾午盤量縮期)
-        t = datetime.strptime(sig.time_str, "%H:%M:%S")
-        mins = (t.hour - 9) * 60 + t.minute
+# ==================== HTTP ====================
+def http_get_json(url, retries=2, timeout=12, **kw):
+    last = None
+    for i in range(retries + 1):
+        try:
+            r = requests.get(url, timeout=timeout, headers=UA, **kw)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            if i < retries:
+                time.sleep(1.5 * (i + 1))
+    log(f"[Error] GET 失敗 {url}: {last}")
+    return None
 
-        if mins < 15:
-            score -= 25
-            alerts.append("⚠️ 09:15 前開盤首 15 分 K 線尚未走完確認")
-        elif 15 <= mins <= 60:
-            pass  # 09:15 ~ 10:00 黃金推升時段
-        elif 60 < mins <= 150:
-            score -= 15
-            alerts.append(
-                f"⚠️ {sig.time_str} 進入午盤量縮震盪區，動能易受阻中斷"
-            )
+
+# ==================== 盤後資料與籌碼過濾 ====================
+def fetch_twse_daily():
+    data = http_get_json(TWSE_DAY_ALL, timeout=20)
+    if not isinstance(data, list) or not data:
+        return [], None
+    rows, dates = [], set()
+    for s in data:
+        code = str(s.get("Code", "")).strip()
+        chg_raw = str(s.get("Change", "0")).strip()
+        if "X" in chg_raw.upper():
+            continue
+        o, h, l, c = (to_float(s.get(k)) for k in ("OpeningPrice", "HighestPrice", "LowestPrice", "ClosingPrice"))
+        vol, val = to_float(s.get("TradeVolume")), to_float(s.get("TradeValue"))
+        if None in (o, h, l, c, vol, val) or vol <= 0:
+            continue
+        d = roc_to_date(s.get("Date"))
+        if d:
+            dates.add(d)
+        rows.append({
+            "market": "tse", "code": code, "name": str(s.get("Name", "")).strip(), "open": o,
+            "high": h, "low": l, "close": c, "change": to_float(chg_raw, 0.0),
+            "vol_shares": vol, "lots": vol / 1000.0, "value": val
+        })
+    return rows, (max(dates) if dates else None)
+
+
+def fetch_tpex_daily():
+    data = http_get_json(TPEX_DAY_ALL, timeout=20)
+    if not isinstance(data, list) or not data:
+        return [], None
+    rows, dates = [], set()
+    for s in data:
+        code = str(pick(s, "SecuritiesCompanyCode", "Code") or "").strip()
+        name = str(pick(s, "CompanyName", "Name") or "").strip()
+        o, h, l, c = (to_float(pick(s, *k)) for k in (("Open", "OpeningPrice"), ("High", "HighestPrice"),
+                                                       ("Low", "LowestPrice"), ("Close", "ClosingPrice")))
+        chg = to_float(pick(s, "Change"), 0.0)
+        vol = to_float(pick(s, "TradingShares", "TradeVolume"))
+        val = to_float(pick(s, "TransactionAmount", "TradeValue"))
+        if not code or None in (o, h, l, c, vol, val) or vol <= 0:
+            continue
+        d = roc_to_date(pick(s, "Date"))
+        if d:
+            dates.add(d)
+        rows.append({
+            "market": "otc", "code": code, "name": name, "open": o, "high": h, "low": l, "close": c,
+            "change": chg, "vol_shares": vol, "lots": vol / 1000.0, "value": val
+        })
+    return rows, (max(dates) if dates else None)
+
+
+def fetch_twse_daytrade_shares(data_date):
+    if not data_date:
+        return {}
+    data = http_get_json(
+        TWSE_DAYTRADE_STATS,
+        params={"date": data_date.strftime("%Y%m%d"), "selectType": "All", "response": "json"}
+    )
+    out = {}
+    for t in (data or {}).get("tables") or []:
+        fields = t.get("fields") or []
+        if "證券代號" not in fields:
+            continue
+        idx = next((i for i, f in enumerate(fields) if "當日沖銷交易成交股數" in f), None)
+        if idx is None:
+            continue
+        ic = fields.index("證券代號")
+        for row in t.get("data") or []:
+            sh = to_float(row[idx])
+            if sh is not None:
+                out[str(row[ic]).strip()] = sh
+    return out
+
+
+def fetch_risk_filters(data_date):
+    excluded = {}
+    notice = http_get_json(TWSE_NOTICE)
+    if isinstance(notice, list):
+        for it in notice:
+            c = str(it.get("Code", "")).strip()
+            if c:
+                excluded[c] = "注意股"
+    else:
+        alert_once("notice_fail", "注意股 API 取得失敗, 本次未過濾注意股")
+
+    allow = None
+    lst = http_get_json(TWSE_DAYTRADE_LIST)
+    if isinstance(lst, list) and len(lst) > 300:
+        allow = {str(it.get("Code", "")).strip() for it in lst}
+    else:
+        alert_once("daytrade_list_fail", "可當沖清單取得失敗, 本次未過濾不可當沖標的")
+
+    dt_shares = fetch_twse_daytrade_shares(data_date)
+    if not dt_shares:
+        alert_once("daytrade_ratio_fail", "當沖比資料取得失敗, 本次未過濾當沖過熱標的")
+    return excluded, allow, dt_shares
+
+
+def generate_watchlist(require_date=None, only_if_newer=False, announce=True):
+    rows, data_date = fetch_twse_daily()
+    if not rows or not data_date:
+        alert_once("day_all_fail", "STOCK_DAY_ALL 取得失敗或無資料, 無法建立作戰清單")
+        return False
+    if require_date and data_date != require_date:
+        log(f"[Info] 上市日成交資料日期為 {data_date}, 尚未更新到 {require_date}, 稍後重試")
+        return False
+    if only_if_newer:
+        old = load_json(WATCHLIST_FILE, None)
+        old_date = old.get("data_date") if isinstance(old, dict) else None
+        if old_date and old_date >= data_date.isoformat():
+            return "skip"
+
+    otc, otc_date = fetch_tpex_daily()
+    if otc and otc_date == data_date:
+        rows += otc
+    else:
+        alert_once("tpex_fail", f"上櫃資料不可用或日期不符(上市 {data_date} / 上櫃 {otc_date}), 本次清單僅含上市股")
+
+    excluded, allow, dt_shares = fetch_risk_filters(data_date)
+    cands = []
+    for r in rows:
+        code = r["code"]
+        if not (len(code) == 4 and code.isdigit()) or code.startswith("0") or r["name"].endswith("-DR"):
+            continue
+        if code in excluded:
+            continue
+        if r["market"] == "tse" and allow is not None and code not in allow:
+            continue
+        if r["close"] < MIN_PRICE or r["lots"] < MIN_LOTS:
+            continue
+        ref = r["close"] - r["change"]
+        if ref <= 0:
+            continue
+        amp = (r["high"] - r["low"]) / ref * 100
+        if amp < MIN_AMPLITUDE_PCT:
+            continue
+        ratio = None
+        if r["market"] == "tse" and dt_shares.get(code):
+            ratio = dt_shares[code] / r["vol_shares"] * 100
+            if ratio >= DAYTRADE_RATIO_MAX:
+                continue
+        cands.append({
+            "market": r["market"], "code": code, "name": r["name"], "close": r["close"],
+            "pct_change": round(r["change"] / ref * 100, 2), "amplitude": round(amp, 2),
+            "daytrade_ratio": None if ratio is None else round(ratio, 1),
+            "val": r["value"], "vol": int(r["lots"])
+        })
+    cands.sort(key=lambda x: x["val"], reverse=True)
+    watch = cands[:WATCHLIST_SIZE]
+    if not watch:
+        alert_once("empty_watch", "篩選後作戰清單為空, 請檢查篩選條件與資料來源")
+        return False
+
+    save_json(WATCHLIST_FILE, {
+        "data_date": data_date.isoformat(),
+        "built_at": now_tw().isoformat(),
+        "items": watch
+    })
+    if announce:
+        msg = (f"🎯 <b>【明日當沖精選作戰清單】</b>(資料日 {data_date})\n━━━━━━━━━━━━━━━━━━\n"
+               f"成交值排序, 已排除注意股、當沖過熱、ETF, 且振幅 ≥ {MIN_AMPLITUDE_PCT}%:\n\n")
+        for i, it in enumerate(watch[:10], 1):
+            mk = "櫃" if it["market"] == "otc" else "市"
+            msg += (f"{i}. <b>{esc(it['code'])} {esc(it['name'])}</b>({mk})｜收 <code>{it['close']}</code> "
+                    f"({it['pct_change']:+}%)｜量 <code>{it['vol']:,}</code> 張\n")
+        if len(watch) > 10:
+            msg += f"<i>...另有 {len(watch) - 10} 檔已列入明日監控池</i>\n"
+        msg += ("━━━━━━━━━━━━━━━━━━\n📌 <b>明日作戰準則</b>:\n"
+                "• 09:03～09:18 僅針對「跳空開高＋不破開盤」執行快沖\n"
+                "• 09:35～10:30 主流壓縮突破、回踩VWAP支撐進場\n"
+                "• 10:30～11:20 洗盤泥沼時段禁止開新倉")
+        send_telegram_message(msg)
+    return True
+
+
+def load_watchlist():
+    data = load_json(WATCHLIST_FILE, None)
+    items, dd = None, None
+    if isinstance(data, dict):
+        items, dd = data.get("items"), data.get("data_date")
+    elif isinstance(data, list):
+        items = data
+    if items:
+        if dd and (now_tw().date() - date.fromisoformat(dd)).days > 5:
+            alert_once("stale_watch", f"作戰清單已過期(資料日 {dd}), 請檢查盤後建檔流程")
+        return [f"{it.get('market', 'tse')}_{it['code']}.tw" for it in items]
+    alert_once("no_watchlist", "找不到作戰清單, 改用備用名單")
+    return list(FALLBACK_WATCH)
+
+
+# ==================== 即時行情 (MIS) ====================
+_session = None
+
+
+def mis_session():
+    global _session
+    if _session is None:
+        s = requests.Session()
+        s.headers.update(UA)
+        try:
+            s.get("https://mis.twse.com.tw/stock/index.jsp", timeout=8)
+        except Exception:
+            pass
+        _session = s
+    return _session
+
+
+def fetch_mis_quotes(ex_ch_list, chunk=40):
+    global _session
+    out = []
+    items = list(ex_ch_list)
+    for i in range(0, len(items), chunk):
+        part = items[i:i + chunk]
+        url = (f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={'|'.join(part)}"
+               f"&json=1&delay=0&_={int(time.time() * 1000)}")
+        try:
+            r = mis_session().get(url, timeout=8)
+            r.raise_for_status()
+            out.extend(r.json().get("msgArray", []))
+        except Exception as e:
+            log(f"[Error] MIS 取價失敗: {e}")
+            _session = None
+        if i + chunk < len(items):
+            time.sleep(0.3)
+    return out
+
+
+def _split_nums(s):
+    return [x for x in str(s or "").split("_") if x]
+
+
+def parse_quote(q):
+    code = q.get("c")
+    if not code:
+        return None
+    last_p = to_float(q.get("z"))
+    trade_vol_shares = to_float(q.get("v"), 0) or 0
+    trade_val_amount = to_float(q.get("tv_amt", q.get("a_amt", 0)))
+
+    vwap = None
+    if trade_val_amount and trade_vol_shares and trade_vol_shares > 0:
+        vwap = round(trade_val_amount / trade_vol_shares, 2)
+
+    return {
+        "code": code, "name": q.get("n", ""), "ex": q.get("ex", "tse"),
+        "last": last_p,
+        "bid1": to_float((_split_nums(q.get("b")) or [None])[0]),
+        "ask1": to_float((_split_nums(q.get("a")) or [None])[0]),
+        "open": to_float(q.get("o")), "high": to_float(q.get("h")), "low": to_float(q.get("l")),
+        "prev": to_float(q.get("y")), "vol": int(trade_vol_shares),
+        "trade_val": trade_val_amount,
+        "vwap": vwap,
+        "date": q.get("d"),
+        "ask_vols": [int(x) for x in _split_nums(q.get("f")) if x.isdigit()],
+        "bid_vols": [int(x) for x in _split_nums(q.get("g")) if x.isdigit()],
+    }
+
+
+def analyze_order_book(q):
+    """五檔買賣結構、力竭檢查與下虛上實辨識"""
+    asks, bids = q["ask_vols"], q["bid_vols"]
+    total = sum(asks) + sum(bids)
+    if total == 0:
+        return 0.5, False, "中性"
+
+    share = sum(bids) / total
+    first_ask = asks[0] if asks else 0
+    first_bid = bids[0] if bids else 0
+    rest_asks = asks[1:] if len(asks) > 1 else [first_ask]
+    rest_bids = bids[1:] if len(bids) > 1 else [first_bid]
+    avg_rest_ask = sum(rest_asks) / len(rest_asks) if rest_asks else first_ask
+    avg_rest_bid = sum(rest_bids) / len(rest_bids) if rest_bids else first_bid
+
+    # 多頭力竭: 賣一異常龐大 (壓頂) 且買盤比率萎縮
+    is_exhausted = (first_ask > avg_rest_ask * 3.2) and (share < 0.50)
+
+    structure = "中性"
+    if first_bid > avg_rest_bid * 3 and share > 0.65 and q["last"] and q["high"] and q["last"] < q["high"] * 0.99:
+        structure = "誘多疑慮(下實上虛)"
+    elif first_ask >= avg_rest_ask * 1.5 and share >= 0.55:
+        structure = "健康吃單(下虛上實)"
+
+    return share, is_exhausted, structure
+
+
+def get_market_index_status():
+    """加權指數監控 (tse_t00.tw)"""
+    try:
+        raw = fetch_mis_quotes([INDEX_SYMBOL])
+        if raw:
+            q = parse_quote(raw[0])
+            if q and q["last"] and q["prev"]:
+                pct = (q["last"] - q["prev"]) / q["prev"] * 100
+                is_weak = (pct < -0.3) or (q["open"] and q["last"] < q["open"])
+                return {"valid": True, "pct": round(pct, 2), "weak": is_weak, "last": q["last"]}
+    except Exception as e:
+        log(f"[Warn] 讀取加權指數失敗: {e}")
+    return {"valid": False, "pct": 0.0, "weak": False, "last": 0.0}
+
+
+# ==================== 策略評估 ====================
+def _stamp():
+    n = now_tw()
+    return n.strftime("%Y-%m-%d"), n.strftime("%H:%M:%S")
+
+
+def make_signal_id(d, t, code, strategy):
+    return f"{d}_{t}_{code}_{strategy}"
+
+
+def calculate_vwap_bias(p, o, h, l, vwap):
+    ref_vwap = vwap if vwap and vwap > 0 else round((h + l + p) / 3, 2)
+    bias = ((p - ref_vwap) / ref_vwap) * 100
+    return ref_vwap, round(bias, 2)
+
+
+def evaluate_opening_rush(q, market_status):
+    """開盤 15 分快沖邏輯"""
+    p, o, h, l, y = q["last"], q["open"], q["high"], q["low"], q["prev"]
+    if not p or p <= 0 or not o or not h or not y or y <= 0 or o <= 0:
+        return None
+
+    if market_status.get("weak") and market_status.get("pct", 0) < -0.6:
+        return None
+
+    gap = (o - y) / y * 100
+    pct = (p - y) / y * 100
+    share, exhausted, structure = analyze_order_book(q)
+
+    if exhausted or structure == "誘多疑慮(下實上虛)":
+        return None
+
+    if not (1.5 <= gap <= 5.0 and p >= o and p >= h * 0.995 and 2.0 <= pct <= 6.5
+            and share >= 0.58 and q["vol"] >= 800):
+        return None
+
+    ref_vwap, bias = calculate_vwap_bias(p, o, h, l, q["vwap"])
+    if bias > MAX_VWAP_BIAS + 0.5:
+        return None
+
+    stop = round_tick(min(max(o, p * 0.985), p * (1 - MIN_RISK_RUSH)), "down")
+    target = round_tick(p + (p - stop) * 1.5, "up")
+    d, t = _stamp()
+
+    return {
+        "signal_id": make_signal_id(d, t, q["code"], "開盤快沖"),
+        "strategy": "開盤快沖", "date": d, "time": t,
+        "market": q["ex"], "code": q["code"], "name": q["name"],
+        "price": p, "pct_change": round(pct, 2),
+        "vwap": ref_vwap, "vwap_bias": bias,
+        "volume": q["vol"], "stop_loss": stop, "target_price": target, "wave": "",
+        "day_high_at_signal": h, "day_low_at_signal": l,
+        "extra_info": f"五檔買比 {share * 100:.1f}% ｜ VWAP乖離 {bias:+}% ｜ {structure}",
+        "link": f"https://tw.stock.yahoo.com/quote/{q['code']}"
+    }
+
+
+def evaluate_trend_breakout(q, market_status):
+    """09:35 ~ 13:15 波動壓縮後首度突破邏輯 (Squeeze Breakout)"""
+    p, o, h, l, y = q["last"], q["open"], q["high"], q["low"], q["prev"]
+    if not p or p < MIN_PRICE or not h or not l or not y or y <= 0:
+        return None
+
+    if market_status.get("weak"):
+        return None
+
+    pct = (p - y) / y * 100
+    share, exhausted, structure = analyze_order_book(q)
+
+    if exhausted or structure == "誘多疑慮(下實上虛)":
+        return None
+
+    # 基礎突破門檻
+    if not (p >= h * 0.995 and 2.5 <= pct <= 7.5 and share >= 0.55):
+        return None
+
+    ref_vwap, bias = calculate_vwap_bias(p, o, h, l, q["vwap"])
+
+    # 1. VWAP 正乖離門檻: 避免追在天花板
+    if bias > MAX_VWAP_BIAS:
+        log(f"[Skip] {q['code']} 創高但 VWAP 正乖離過大 ({bias}% > {MAX_VWAP_BIAS}%), 放棄進場")
+        return None
+
+    # 2. 波動壓縮驗證: 當日早盤低點到突破前高點，振幅不可過大失控 (壓縮後初噴最佳)
+    intraday_swing = (h - l) / l * 100
+    if intraday_swing > 9.0:  # 已噴出過度, 容易洗盤
+        return None
+
+    stop = round_tick(min(max(l, p * 0.978), p * (1 - MIN_RISK_TREND)), "down")
+    target = round_tick(p + (p - stop) * 2.0, "up")
+    d, t = _stamp()
+
+    return {
+        "signal_id": make_signal_id(d, t, q["code"], "主流突破"),
+        "strategy": "主流突破", "date": d, "time": t,
+        "market": q["ex"], "code": q["code"], "name": q["name"],
+        "price": p, "pct_change": round(pct, 2),
+        "vwap": ref_vwap, "vwap_bias": bias,
+        "volume": q["vol"], "stop_loss": stop, "target_price": target, "wave": 1,
+        "day_high_at_signal": h, "day_low_at_signal": l,
+        "extra_info": f"五檔買比 {share * 100:.1f}% ｜ VWAP乖離 {bias:+}% ｜ 壓縮後首發",
+        "link": f"https://tw.stock.yahoo.com/quote/{q['code']}"
+    }
+
+
+# ==================== 訊號紀錄 (CSV) ====================
+def read_signals():
+    if not os.path.exists(SIGNALS_FILE):
+        return []
+    rows = []
+    with open(SIGNALS_FILE, newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if not header:
+            return []
+        for r in reader:
+            if not r:
+                continue
+            d = dict(zip(header, r))
+            rows.append(d)
+    return rows
+
+
+def ensure_signals_schema():
+    if not os.path.exists(SIGNALS_FILE):
+        return
+    with open(SIGNALS_FILE, newline="", encoding="utf-8-sig") as f:
+        header = next(csv.reader(f), [])
+    if header == SIGNAL_COLUMNS:
+        return
+    rows = read_signals()
+    backup = f"{SIGNALS_FILE}.bak_{now_tw():%Y%m%d%H%M%S}"
+    shutil.copy(SIGNALS_FILE, backup)
+    with open(SIGNALS_FILE, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=SIGNAL_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        for d in rows:
+            d.setdefault("market", "tse")
+            d.setdefault("vwap", "")
+            d.setdefault("vwap_bias", "")
+            d["signal_id"] = d.get("signal_id") or make_signal_id(d.get("date"), d.get("time"),
+                                                                  d.get("code"), d.get("strategy"))
+            w.writerow(d)
+    log(f"[Info] 已將 {SIGNALS_FILE} 轉為固定欄位 ({len(rows)} 筆), 備份於 {backup}")
+
+
+def append_rows(path, columns, rows):
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    new_file = not os.path.isfile(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        if new_file:
+            w.writeheader()
+        w.writerows(rows)
+
+
+def build_recent_alerts(today):
+    alerts = {}
+    for d in read_signals():
+        if d.get("date") != today:
+            continue
+        try:
+            t = TW_TZ.localize(datetime.strptime(f"{d['date']} {d['time']}", "%Y-%m-%d %H:%M:%S"))
+            price = float(d["price"])
+        except (KeyError, ValueError):
+            continue
+        e = alerts.setdefault(str(d["code"]).strip(), {"time": t, "price": price, "count": 0})
+        e["count"] += 1
+        if t >= e["time"]:
+            e["time"], e["price"] = t, price
+    return alerts
+
+
+# ==================== 結果追蹤與動能竭盡 (熄燈) 警示 ====================
+def position_from_signal(d):
+    f = lambda k: to_float(d.get(k))
+    return {
+        "signal_id": d["signal_id"], "date": d["date"], "time": d["time"], "strategy": d["strategy"],
+        "market": d.get("market") or "tse", "code": str(d["code"]).strip(), "name": d.get("name", ""),
+        "entry": f("price"), "stop": f("stop_loss"), "target": f("target_price"),
+        "original_stop": f("stop_loss"),
+        "day_high_at_signal": f("day_high_at_signal"), "day_low_at_signal": f("day_low_at_signal"),
+        "touched_target": False, "touched_stop": False, "first_touch": None, "trailed_to_be": False,
+        "warned_exhaustion": False, "resolved": False
+    }
+
+
+def ensure_positions_state(day, state):
+    done = set(pd.read_csv(RESULTS_FILE, usecols=["signal_id"])["signal_id"]) if os.path.exists(RESULTS_FILE) else set()
+    for d in read_signals():
+        if d.get("date") != day or not d.get("signal_id"):
+            continue
+        if d["signal_id"] in state or d["signal_id"] in done:
+            continue
+        if None in (to_float(d.get("price")), to_float(d.get("stop_loss")), to_float(d.get("target_price"))):
+            continue
+        state[d["signal_id"]] = position_from_signal(d)
+    return state
+
+
+def update_positions_and_check_exhaustion(parsed, state):
+    """
+    更新在倉部位，並檢查是否出現「主力熄燈 / 動能竭盡」轉折點
+    """
+    qmap = {q["code"]: q for q in parsed}
+    exhaustion_alerts = []
+
+    for p in state.values():
+        if p.get("resolved"):
+            continue
+        q = qmap.get(p["code"])
+        if not q:
+            continue
+
+        price = q["last"] if q["last"] is not None else q["bid1"]
+        if price is None:
+            continue
+
+        # 1. 保本停損推升: 獲利達 +1.0% 時將停損移動至成本價
+        if not p.get("trailed_to_be") and price >= p["entry"] * 1.010:
+            p["stop"] = p["entry"]
+            p["trailed_to_be"] = True
+
+        # 2. 熄燈轉折預警 (動能竭盡偵測):
+        # 條件: 曾有獲利、股價自高點拉回 > 0.8%、五檔買單佔比跌破 48% 且賣一異常厚重
+        share, is_exhausted, _ = analyze_order_book(q)
+        high_p = q.get("high") or p["entry"]
+        pullback_from_high = (high_p - price) / high_p * 100 if high_p > 0 else 0
+
+        if not p.get("warned_exhaustion") and price > p["entry"] and pullback_from_high >= 0.8:
+            if is_exhausted or share < 0.46:
+                p["warned_exhaustion"] = True
+                exhaustion_alerts.append({
+                    "code": p["code"], "name": p["name"], "entry": p["entry"], "price": price,
+                    "gain_pct": round((price - p["entry"]) / p["entry"] * 100, 2),
+                    "pullback": round(pullback_from_high, 2),
+                    "link": f"https://tw.stock.yahoo.com/quote/{p['code']}"
+                })
+
+        # 3. 停損與停利觸及判定
+        before = (p["touched_target"], p["touched_stop"])
+        if price >= p["target"]:
+            p["touched_target"] = True
+        if price <= p["stop"]:
+            p["touched_stop"] = True
+
+        dh, dl = p.get("day_high_at_signal"), p.get("day_low_at_signal")
+        if dh is not None and q["high"] is not None and q["high"] > dh and q["high"] >= p["target"]:
+            p["touched_target"] = True
+        if dl is not None and q["low"] is not None and q["low"] < dl and q["low"] <= p["stop"]:
+            p["touched_stop"] = True
+
+        new = {k for k, b, a in (("target", before[0], p["touched_target"]), ("stop", before[1], p["touched_stop"]))
+               if a and not b}
+        if p.get("first_touch") is None and len(new) == 1 and not any(before):
+            p["first_touch"] = new.pop()
+
+    # 發送主力熄燈轉折警告
+    for it in exhaustion_alerts:
+        msg = (
+            f"💡 <b>【動能竭盡 / 主力熄燈轉折警示】</b> ⚠️\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"標的: <b>{esc(it['code'])} {esc(it['name'])}</b>\n"
+            f"進場參考: <code>{it['entry']}</code> 元 ｜ 現價: <code>{it['price']}</code> 元 ({it['gain_pct']:+}%)\n"
+            f"轉折跡象: 自高點回撤 <code>{it['pullback']}%</code>，五檔買力明顯熄火、賣壓壓頂\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 <b>建議處置</b>: 買盤動能衰退，請嚴守保本或<b>提早分批獲利了結</b>，切勿抱到虧損！\n"
+            f"🔗 <a href=\"{esc(it['link'])}\">點擊開啟 Yahoo 看盤確認</a>"
+        )
+        send_telegram_message(msg)
+
+    return state
+
+
+def compute_trade_pnl(entry, exit_price, stop):
+    e_eff, x_eff = entry * (1 + SLIPPAGE), exit_price * (1 - SLIPPAGE)
+    gross = (x_eff - e_eff) / e_eff * 100
+    cost = (2 * FEE_RATE * FEE_DISCOUNT + DAYTRADE_TAX) * 100
+    net = gross - cost
+    risk = (entry - stop) / entry * 100
+    return round(gross, 3), round(cost, 3), round(net, 3), round(risk, 3), (round(net / risk, 2) if risk > 0 else None)
+
+
+def resolve_outcome(p, close):
+    tt, ts, first = p["touched_target"], p["touched_stop"], p.get("first_touch")
+    legacy = p.get("day_high_at_signal") is None
+    note = ""
+    if tt and ts:
+        if first == "target":
+            outcome, exit_p = "WIN", p["target"]
+        elif first == "stop":
+            outcome, exit_p = "LOSS", p["stop"]
         else:
-            score -= 40
-            alerts.append("❌ 11:30 後尾盤當沖結算潮，不建議開新倉")
+            outcome, exit_p = "AMBIGUOUS", p["stop"]
+            note = "停損與停利皆被觸及且無法判定先後, 保守以停損計"
+    elif tt:
+        outcome, exit_p = "WIN", p["target"]
+    elif ts:
+        outcome, exit_p = "LOSS", p["stop"]
+        if p.get("trailed_to_be"):
+            note = "觸發保本出場"
+    elif legacy:
+        outcome, exit_p, note = "NO_DATA", None, "舊版訊號缺少進場當下極值, 不計入統計"
+    else:
+        outcome, exit_p = "TIME_EXIT", close
+        note = "未觸及停損/停利, 以收盤價出場"
 
-        # 4. 突破幅度檢驗
-        breakout_pct = (sig.price - sig.high_15m) / sig.high_15m * 100
-        if breakout_pct < 0:
-            score -= 50
-            alerts.append("❌ 現價尚未有效突破首 15 分高點")
-        elif breakout_pct > 2.5:
-            score -= 20
-            alerts.append(f"⚠️ 已脫離突破點 +{breakout_pct:.2f}%，追價風報比不佳")
+    row = {
+        "signal_id": p["signal_id"], "date": p["date"], "time": p["time"], "strategy": p["strategy"],
+        "market": p["market"], "code": p["code"], "name": p["name"], "entry": p["entry"], "stop": p["stop"],
+        "target": p["target"], "outcome": outcome, "touched_target": tt, "touched_stop": ts,
+        "first_touch": first or "", "close_price": close, "note": note
+    }
+    if exit_p is not None:
+        g, c, n, r, rm = compute_trade_pnl(p["entry"], exit_p, p["original_stop"] or p["stop"])
+        row.update({"exit_price": exit_p, "gross_pct": g, "cost_pct": c, "net_pct": n, "risk_pct": r, "r_multiple": rm})
+    return row
 
-        # 5. 精準防守點計算 (採首15分高點下 2 個 tick 防守)
-        tight_sl = round(sig.high_15m * 0.998, 1)
-        tight_risk = sig.price - tight_sl
-        reward = sig.tp - sig.price
-        optimized_rr = (reward / tight_risk) if tight_risk > 0 else 0
 
-        # 原訊號風報比
-        orig_risk = sig.price - sig.sl
-        orig_rr = (reward / orig_risk) if orig_risk > 0 else 0
+def finalize_results(day):
+    state = ensure_positions_state(day, load_json(STATE_FILE, {}))
+    pending = {k: p for k, p in state.items() if p["date"] == day and not p.get("resolved")}
+    if pending:
+        ex = sorted({f"{p['market']}_{p['code']}.tw" for p in pending.values()})
+        parsed = [q for q in (parse_quote(x) for x in fetch_mis_quotes(ex)) if q]
+        update_positions_and_check_exhaustion(parsed, state)
+        qmap = {q["code"]: q for q in parsed}
+        rows = []
+        for p in pending.values():
+            q = qmap.get(p["code"])
+            if not q or q["last"] is None:
+                log(f"[Warn] {p['code']} 無收盤價, 稍後重試")
+                continue
+            rows.append(resolve_outcome(p, q["last"]))
+            p["resolved"] = True
+        append_rows(RESULTS_FILE, RESULT_COLUMNS, rows)
+    cutoff = (now_tw().date() - timedelta(days=3)).isoformat()
+    state = {k: v for k, v in state.items() if not (v.get("resolved") and v["date"] < cutoff)}
+    save_json(STATE_FILE, state)
 
-        # 結論判定
-        score = max(0, min(100, score))
-        if score >= 75:
-            verdict = "🟢 允許進場 (APPROVED)"
-            entry_strategy = "可於現價或回踩 1 tick 內順勢切入。"
-        elif score >= 55:
-            verdict = "🟡 僅限回測掛單 (PULLBACK ONLY)"
-            entry_strategy = f"<b>嚴禁市價追單！</b>僅能於突破點 <b>{sig.high_15m}</b> 附近掛買單承接。"
-        else:
-            verdict = "🔴 放棄操作 (REJECTED)"
-            entry_strategy = "風險過高或高機率為假突破，建議取消觀察。"
 
-        return {
-            "symbol": sig.symbol,
-            "score": score,
-            "verdict": verdict,
-            "entry_strategy": entry_strategy,
-            "tight_sl": tight_sl,
-            "orig_sl": sig.sl,
-            "vwap_bias": round(vwap_bias, 2),
-            "orig_rr": round(orig_rr, 2),
-            "optimized_rr": round(optimized_rr, 2),
-            "alerts": alerts,
+# ==================== 勝率統計 ====================
+def wilson_ci(k, n, z=1.96):
+    if n == 0:
+        return 0.0, 0.0
+    p = k / n
+    den = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / den
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return centre - half, centre + half
+
+
+def load_results_df(days=0, day=None):
+    if not os.path.exists(RESULTS_FILE):
+        return pd.DataFrame()
+    df = pd.read_csv(RESULTS_FILE, encoding="utf-8-sig", dtype={"code": str})
+    df = df[df["outcome"].isin(["WIN", "LOSS", "AMBIGUOUS", "TIME_EXIT"])].copy()
+    df["net_pct"] = pd.to_numeric(df["net_pct"], errors="coerce")
+    df = df.dropna(subset=["net_pct"])
+    if day:
+        df = df[df["date"] == day]
+    elif days > 0:
+        df = df[df["date"] >= (now_tw().date() - timedelta(days=days)).isoformat()]
+    return df.sort_values(["date", "time"]).reset_index(drop=True)
+
+
+def compute_stats(df):
+    n = len(df)
+    if n == 0:
+        return None
+    net = df["net_pct"]
+    wins, losses = net[net > 0], net[net <= 0]
+    avg_win = wins.mean() if len(wins) else 0.0
+    avg_loss = -losses.mean() if len(losses) else 0.0
+    loss_sum = -losses.sum()
+    lo, hi = wilson_ci(len(wins), n)
+    std = net.std(ddof=1) if n > 1 else 0.0
+    equity = net.cumsum()
+    streak = cur = 0
+    for v in net:
+        cur = cur + 1 if v <= 0 else 0
+        streak = max(streak, cur)
+    return {
+        "n": n, "win_rate": len(wins) / n, "ci": (lo, hi), "avg_win": avg_win, "avg_loss": avg_loss,
+        "expectancy": net.mean(), "profit_factor": (wins.sum() / loss_sum) if loss_sum > 0 else float("inf"),
+        "breakeven_wr": (avg_loss / (avg_win + avg_loss)) if (avg_win + avg_loss) > 0 else None,
+        "t_stat": (net.mean() / (std / math.sqrt(n))) if std > 0 else 0.0, "total": net.sum(),
+        "max_dd": (equity.cummax() - equity).max(), "max_loss_streak": streak,
+        "outcomes": df["outcome"].value_counts().to_dict()
+    }
+
+
+def format_stats(s, title):
+    if not s:
+        return [title, "  尚無已結算的訊號"]
+    pf = "∞" if s["profit_factor"] == float("inf") else f"{s['profit_factor']:.2f}"
+    be = "-" if s["breakeven_wr"] is None else f"{s['breakeven_wr'] * 100:.1f}%"
+    lines = [
+        title,
+        f"  樣本數: {s['n']}   結果分布: {s['outcomes']}",
+        f"  勝率(淨損益>0): {s['win_rate'] * 100:.1f}%   95%信賴區間: {s['ci'][0] * 100:.0f}%~{s['ci'][1] * 100:.0f}%",
+        f"  平均獲利 {s['avg_win']:+.2f}%  平均虧損 -{s['avg_loss']:.2f}%  損益兩平勝率 {be}",
+        f"  期望值(每筆淨%): {s['expectancy']:+.3f}%   獲利因子: {pf}   t值: {s['t_stat']:.2f}",
+        f"  累計淨損益: {s['total']:+.2f}%   最大回落: {s['max_dd']:.2f}%   最長連虧: {s['max_loss_streak']}"
+    ]
+    if s["n"] < 100:
+        lines.append(f"  ⚠ 樣本僅 {s['n']} 筆(<100), 以上數字不具統計意義, 請勿據此調參或加碼")
+    elif abs(s["t_stat"]) < 2:
+        lines.append("  ⚠ |t| < 2: 期望值與 0 沒有顯著差異")
+    return lines
+
+
+def build_report(days=0):
+    df = load_results_df(days=days)
+    label = f"近 {days} 天" if days else "全部"
+    lines = format_stats(compute_stats(df), f"【累計績效 - {label}】")
+    if len(df):
+        for strat, g in df.groupby("strategy"):
+            lines += [""] + format_stats(compute_stats(g), f"【{strat}】")
+    total = len(read_signals())
+    lines += ["", f"signals_history.csv 共 {total} 筆訊號, 其中 {len(df)} 筆已納入結果統計"]
+    lines.append(f"成本假設: 手續費 {FEE_RATE * 100:.4f}%×{FEE_DISCOUNT} 雙邊 + 證交稅 {DAYTRADE_TAX * 100:.2f}% "
+                 f"+ 單邊滑價 {SLIPPAGE * 100:.2f}%")
+    return lines
+
+
+def finalize_and_review(today):
+    sigs = [d for d in read_signals() if d.get("date") == today]
+    probe = [q for q in (parse_quote(x) for x in fetch_mis_quotes(["tse_2330.tw"])) if q]
+    if not probe or probe[0]["date"] != today.replace("-", ""):
+        log("[Info] 查無今日行情 (休市日或 MIS 暫時無回應)")
+        return not sigs
+    finalize_results(today)
+    df_today = load_results_df(day=today)
+    lines = [f"今日訊號 {len(sigs)} 檔, 已結算 {len(df_today)} 檔"]
+    if len(df_today):
+        for _, r in df_today.iterrows():
+            lines.append(f"{r['outcome']:<9} {r['code']} {r['name']}  進{r['entry']}→出{r['exit_price']}  "
+                         f"淨{r['net_pct']:+.2f}%")
+        lines += [""] + format_stats(compute_stats(df_today), "【今日】")
+    elif not sigs:
+        lines.append("今日作戰清單未出現符合高勝率力道標準的訊號, 空手觀望保持紀律。")
+    lines += [""] + format_stats(compute_stats(load_results_df()), "【累計】")
+    send_telegram_message(f"📋 <b>每日當沖復盤</b> {esc(today)}\n<pre>{esc(chr(10).join(lines))}</pre>")
+    return True
+
+
+# ==================== 推播發送 ====================
+def broadcast_signal(s):
+    head = (f"標的: <b>{esc(s['code'])} {esc(s['name'])}</b> (作戰清單)\n"
+            f"現價: <code>{s['price']}</code> 元 (+{s['pct_change']}%)\n"
+            f"狀態: <code>{esc(s['extra_info'])}</code>\n成交量: <code>{s['volume']:,}</code> 張\n"
+            "━━━━━━━━━━━━━━━━━━\n")
+    link = f'🔗 <a href="{esc(s["link"])}">開啟 Yahoo 看盤確認</a>'
+    if s["strategy"] == "開盤快沖":
+        msg = ("⚡ <b>【開盤 15 分快沖訊號】</b> ⚡\n━━━━━━━━━━━━━━━━━━\n" + head +
+               f"🎯 <b>建議買進</b>: <code>{s['price']}</code> ～ <code>{round(s['price'] * 1.004, 2)}</code>\n"
+               f"🛑 <b>嚴格停損</b>: <code>{s['stop_loss']}</code> 元 (跌破開盤即撤)\n"
+               f"🏆 <b>短沖停利</b>: <code>{s['target_price']}</code> 元\n"
+               "⏱ <b>時間停損</b>: 進場 8 分鐘內未脫離成本區建議平倉\n"
+               "🛡 <b>保本防守</b>: 獲利達 +1.0% 時請將停損推至成本價\n"
+               "━━━━━━━━━━━━━━━━━━\n" + link)
+    else:
+        wave = int(to_float(s.get("wave"), 1) or 1)
+        wave_str = f" (第 {wave} 波發動)" if wave > 1 else ""
+        msg = (f"🔥 <b>【主流大單帶量突破{wave_str}】</b> 🔥\n━━━━━━━━━━━━━━━━━━\n" + head +
+               f"🎯 <b>建議掛單</b>: <code>{s['price']}</code> ～ <code>{round(s['price'] * 1.005, 2)}</code>\n"
+               f"🛑 <b>嚴守停損</b>: <code>{s['stop_loss']}</code> 元\n"
+               f"🏆 <b>波段停利</b>: <code>{s['target_price']}</code> 元 (風報比 1:2)\n"
+               "⏱ <b>時間風控</b>: 10 分鐘內未走出利潤建議平倉\n"
+               "🛡 <b>保本防守</b>: 獲利達 +1.0% 時請將停損推至成本價\n"
+               "━━━━━━━━━━━━━━━━━━\n" + link)
+    send_telegram_message(msg)
+
+
+# ==================== 主流程控制 ====================
+def run_intraday(now, today):
+    t = now.time()
+    if t < dtime(9, 0) or t > dtime(13, 30):
+        return
+
+    is_lunch_slump = (dtime(10, 30) <= t < dtime(11, 20))
+
+    watch_ex = load_watchlist()
+    state = ensure_positions_state(today, load_json(STATE_FILE, {}))
+    open_ex = {f"{p['market']}_{p['code']}.tw" for p in state.values() if p["date"] == today and not p.get("resolved")}
+
+    fetch_list = sorted(set(watch_ex) | open_ex | {INDEX_SYMBOL})
+    parsed = [q for q in (parse_quote(x) for x in fetch_mis_quotes(fetch_list)) if q]
+    if not parsed:
+        log("[Warn] MIS 沒有回傳任何行情")
+        return
+    if not any(q["date"] == today.replace("-", "") for q in parsed):
+        log("[Info] 非交易日或尚未開盤")
+        return
+
+    # 即時更新部位並檢查「主力熄燈 / 動能竭盡」轉折點
+    update_positions_and_check_exhaustion(parsed, state)
+    save_json(STATE_FILE, state)
+
+    idx_q = next((q for q in parsed if q["code"] == "t00"), None)
+    market_status = {"valid": False, "pct": 0.0, "weak": False}
+    if idx_q and idx_q["last"] and idx_q["prev"]:
+        idx_pct = (idx_q["last"] - idx_q["prev"]) / idx_q["prev"] * 100
+        market_status = {
+            "valid": True, "pct": round(idx_pct, 2),
+            "weak": (idx_pct < -0.3) or (idx_q["open"] and idx_q["last"] < idx_q["open"])
         }
 
+    watch_codes = {e.split("_", 1)[1].split(".")[0] for e in watch_ex}
+    recent = build_recent_alerts(today)
+    new_signals = []
 
-evaluator = BreakoutEvaluator()
+    # 時段 A: 開盤快沖 (09:03 ~ 09:18)
+    if dtime(9, 3) <= t <= dtime(9, 18):
+        for q in parsed:
+            if q["code"] not in watch_codes or q["code"] in recent:
+                continue
+            s = evaluate_opening_rush(q, market_status)
+            if s:
+                new_signals.append(s)
+                recent[q["code"]] = {"time": now, "price": s["price"], "count": 1}
+
+    # 時段 B: 主流壓縮突破 (09:35 ~ 13:15, 排除 10:30 ~ 11:20 垃圾時間)
+    elif dtime(9, 35) <= t <= dtime(13, 15):
+        if is_lunch_slump:
+            log("[Info] 目前處於 10:30~11:20 洗盤泥沼時段, 暫停篩選新進場訊號")
+        else:
+            for q in parsed:
+                if q["code"] not in watch_codes:
+                    continue
+                s = evaluate_trend_breakout(q, market_status)
+                if not s:
+                    continue
+                last = recent.get(q["code"])
+                if last and ((now - last["time"]).total_seconds() / 60 < 45 or s["price"] <= last["price"]):
+                    continue
+                s["wave"] = (last["count"] + 1) if last else 1
+                new_signals.append(s)
+                recent[q["code"]] = {"time": now, "price": s["price"], "count": s["wave"]}
+
+    for s in new_signals:
+        state[s["signal_id"]] = position_from_signal(s)
+    save_json(STATE_FILE, state)
+    append_rows(SIGNALS_FILE, SIGNAL_COLUMNS, new_signals)
+    for s in new_signals:
+        broadcast_signal(s)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """處理接收到的所有文字訊息"""
-    if not update.message or not update.message.text:
+def run_cycle():
+    now = now_tw()
+    today, t = now.strftime("%Y-%m-%d"), now.time()
+    if now.weekday() >= 5:
         return
-
-    text = update.message.text
-
-    # 快速關鍵字快篩
-    if "當沖進場訊號" not in text and "放量突破" not in text:
+    if t >= dtime(13, 35):
+        if not flag_done("review", today) and finalize_and_review(today):
+            mark_done("review", today)
+        if t >= dtime(15, 30) and not flag_done("watchlist", today):
+            if generate_watchlist(require_date=now.date()) is True:
+                mark_done("watchlist", today)
         return
-
-    sig = evaluator.parse_signal_text(text)
-    if not sig:
+    if dtime(8, 20) <= t < dtime(8, 55):
+        if not flag_done("catchup", today) and generate_watchlist(only_if_newer=True) in (True, "skip"):
+            mark_done("catchup", today)
         return
+    run_intraday(now, today)
 
-    res = evaluator.evaluate(sig)
 
-    alerts_text = (
-        "\n".join([f"  • {a}" for a in res["alerts"]])
-        if res["alerts"]
-        else "  • 各項量化指標表現健康，無異常風險。"
-    )
+def run_loop(interval):
+    ensure_signals_schema()
+    log(f"[Info] v4 轉折精準版常駐模式啟動, 盤中輪詢間隔 {interval} 秒")
+    while True:
+        try:
+            run_cycle()
+        except Exception as e:
+            log(f"[Error] 本輪執行失敗: {e}\n{traceback.format_exc()}")
+            alert_once("cycle_error", f"主迴圈發生例外: {e}")
+        t = now_tw().time()
+        time.sleep(interval if dtime(8, 58) <= t <= dtime(13, 31) else 60)
 
-    reply_message = (
-        f"🤖 <b>【當沖進場自動檢核報告】</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"標的代號：<code>{res['symbol']}</code>\n"
-        f"勝率評分：<b>{res['score']} / 100</b>\n"
-        f"決策判定：<b>{res['verdict']}</b>\n"
-        f"──────────────────\n"
-        f"💡 <b>操作指引：</b>\n"
-        f"{res['entry_strategy']}\n\n"
-        f"🛡️ <b>防守調整建議：</b>\n"
-        f"• 原訊號停損：<s>{res['orig_sl']} 元</s> (風報比 {res['orig_rr']}R - 偏深)\n"
-        f"• <b>優化防守點：{res['tight_sl']} 元</b> (頸線防守，風報比提升至 <b>{res['optimized_rr']}R</b>)\n"
-        f"• VWAP 乖離率：<b>+{res['vwap_bias']}%</b>\n\n"
-        f"⚠️ <b>風險示警濾網：</b>\n"
-        f"{alerts_text}\n"
-        f"━━━━━━━━━━━━━━━━━━"
-    )
 
-    await update.message.reply_text(
-        text=reply_message,
-        parse_mode=ParseMode.HTML,
-        reply_to_message_id=update.message.message_id,
-    )
+def check_api():
+    def show(name, data):
+        if isinstance(data, list) and data:
+            print(f"[OK]   {name}: {len(data)} 筆\n       欄位 = {list(data[0].keys())}")
+        else:
+            print(f"[FAIL] {name}: 無資料")
+    show("TWSE STOCK_DAY_ALL", http_get_json(TWSE_DAY_ALL, retries=0, timeout=20))
+    show("TWSE notice(注意股)", http_get_json(TWSE_NOTICE, retries=0))
+    show("TWSE TWTB4U(可當沖清單)", http_get_json(TWSE_DAYTRADE_LIST, retries=0))
+    show("TPEx 日成交", http_get_json(TPEX_DAY_ALL, retries=0, timeout=20))
+    rows, d = fetch_twse_daily()
+    print(f"上市解析 {len(rows)} 檔, 資料日 {d}")
+    rows, d = fetch_tpex_daily()
+    print(f"上櫃解析 {len(rows)} 檔, 資料日 {d}")
+    base = d or now_tw().date()
+    print(f"當沖股數解析 {len(fetch_twse_daytrade_shares(base))} 檔")
+    idx_raw = fetch_mis_quotes([INDEX_SYMBOL])
+    if idx_raw:
+        q = parse_quote(idx_raw[0])
+        print(f"加權指數測試: {q['name']} ({q['code']}) 現價: {q['last']}")
 
 
 def main():
-    if not BOT_TOKEN:
-        print("錯誤：未偵測到 TELEGRAM_BOT_TOKEN，請確認環境變數已設定。")
-        return
+    ap = argparse.ArgumentParser(description="台股當沖訊號機器人 v4 (小哥體系轉折與動能竭盡精準版)")
+    ap.add_argument("--loop", action="store_true", help="常駐輪詢模式")
+    ap.add_argument("--interval", type=int, default=15, help="常駐模式盤中輪詢秒數")
+    ap.add_argument("--report", action="store_true", help="輸出累計績效報告")
+    ap.add_argument("--days", type=int, default=0, help="報告只看最近 N 天")
+    ap.add_argument("--send", action="store_true", help="報告同步推送 Telegram")
+    ap.add_argument("--finalize", nargs="?", const="today", help="手動結算 (可指定 YYYY-MM-DD)")
+    ap.add_argument("--build-watchlist", action="store_true", help="立即建立作戰清單")
+    ap.add_argument("--check-api", action="store_true", help="檢查資料來源欄位")
+    a = ap.parse_args()
 
-    print("啟動 Telegram 當沖過濾守門員機器人中...")
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(
-        MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
-    )
-
-    app.run_polling()
+    ensure_signals_schema()
+    if a.check_api:
+        check_api()
+    elif a.report:
+        lines = build_report(a.days)
+        print("\n".join(lines))
+        if a.send:
+            send_telegram_message(f"📊 <b>績效報告</b>\n<pre>{esc(chr(10).join(lines))}</pre>")
+    elif a.finalize:
+        day = now_tw().strftime("%Y-%m-%d") if a.finalize == "today" else a.finalize
+        finalize_results(day)
+        print("\n".join(format_stats(compute_stats(load_results_df(day=day)), f"【{day} 結算】")))
+    elif a.build_watchlist:
+        print("結果:", generate_watchlist())
+    elif a.loop:
+        run_loop(a.interval)
+    else:
+        run_cycle()
 
 
 if __name__ == "__main__":
