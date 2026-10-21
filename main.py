@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 import calendar
 import pandas as pd
@@ -8,11 +9,12 @@ import pytz
 
 TW_TZ = pytz.timezone('Asia/Taipei')
 
-# 環境變數
+# 環境變數設定
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DATA_DIR = "data/history"
 SIGNALS_FILE = os.path.join(DATA_DIR, "signals_history.csv")
+WATCHLIST_FILE = os.path.join(DATA_DIR, "tomorrow_watchlist.json")
 
 def send_telegram_message(message: str):
     """發送 Telegram 訊息通知"""
@@ -31,7 +33,7 @@ def send_telegram_message(message: str):
     except Exception as e:
         print(f"[Error] Telegram 推播失敗: {e}")
 
-# ==================== 籌碼風控與股票池過濾 ====================
+# ==================== 風險籌碼過濾 ====================
 def fetch_risk_stocks_filter():
     """排除注意股票及當沖比 > 45% 的標的"""
     excluded_codes = set()
@@ -63,37 +65,93 @@ def fetch_risk_stocks_filter():
 
     return excluded_codes
 
-def get_top_market_value_stocks(excluded_set, top_n=35):
-    """抓取全市場成交金額排名前 N 大的主流權值/動能標的"""
+# ==================== 盤後功能：產出明日作戰清單 ====================
+def generate_and_broadcast_tomorrow_watchlist():
+    """每日盤後 15:30 執行：挑選明日高周轉、大成交值主流作戰清單"""
+    excluded_set = fetch_risk_stocks_filter()
     url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-    mis_codes = []
+    candidates = []
+
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, timeout=15)
         if res.status_code == 200:
             stocks = res.json()
-            candidates = []
             for s in stocks:
                 code = s.get("Code", "").strip()
+                name = s.get("Name", "").strip()
                 if len(code) != 4 or not code.isdigit() or code in excluded_set:
                     continue
                 try:
                     trade_val = float(s.get("TradeValue", "0").replace(",", ""))
                     close_p = float(s.get("ClosingPrice", "0").replace(",", ""))
-                    if close_p >= 25.0:
-                        candidates.append({"code": code, "val": trade_val})
+                    trade_vol = float(s.get("TradeVolume", "0").replace(",", "")) / 1000 # 張數
+                    change = float(s.get("Change", "0").replace(",", ""))
+                    ref_p = close_p - change
+                    pct_change = (change / ref_p) * 100 if ref_p > 0 else 0
+
+                    # 篩選條件：股價 >= 25元、成交量 >= 2,000張、成交值排在主力資金區
+                    if close_p >= 25.0 and trade_vol >= 2000:
+                        candidates.append({
+                            "code": code,
+                            "name": name,
+                            "close": close_p,
+                            "pct_change": round(pct_change, 2),
+                            "val": trade_val,
+                            "vol": int(trade_vol)
+                        })
                 except ValueError:
                     continue
-            candidates.sort(key=lambda x: x["val"], reverse=True)
-            mis_codes = [f"tse_{item['code']}.tw" for item in candidates[:top_n]]
     except Exception as e:
-        print(f"[Error] 取得動態觀察名單失敗: {e}")
+        print(f"[Error] 取得盤後清單失敗: {e}")
 
-    if not mis_codes:
-        mis_codes = ["tse_2330.tw", "tse_2317.tw", "tse_2454.tw", "tse_3231.tw", "tse_2382.tw"]
-    return mis_codes
+    # 依成交值大小排序，挑選前 20 檔作為明日主力作戰標的
+    candidates.sort(key=lambda x: x["val"], reverse=True)
+    watchlist = candidates[:20]
 
+    if not watchlist:
+        return
+
+    # 儲存至本地 JSON
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
+        json.dump(watchlist, f, ensure_ascii=False, indent=2)
+
+    # 推播明日作戰清單至 Telegram
+    today_str = datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    msg = (
+        f"🎯 *【明日當沖精選作戰清單】* ({today_str} 盤後建檔)\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"依「大成交值 ＋ 高流動性」篩選，已排除注意股與當沖過熱標的：\n\n"
+    )
+    for idx, item in enumerate(watchlist[:10], 1):
+        msg += f"{idx}. *{item['code']} {item['name']}*｜收 `{item['close']}` ({item['pct_change']:+}%)｜量 `{item['vol']:,}` 張\n"
+    
+    if len(watchlist) > 10:
+        msg += f"_...另有 {len(watchlist) - 10} 檔已列入明日監控池_\n"
+
+    msg += (
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📌 *明日作戰準則*：\n"
+        f"• 09:00～09:15 僅針對「跳空開高＋紅K不破開盤」執行快沖\n"
+        f"• 09:35 後確認早盤回檔有撐、過前高才進場主流突破"
+    )
+    send_telegram_message(msg)
+
+def load_today_watchlist():
+    """讀取昨日盤後建檔的今日作戰標的"""
+    if os.path.exists(WATCHLIST_FILE):
+        try:
+            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return [f"tse_{item['code']}.tw" for item in data]
+        except Exception:
+            pass
+    # 若檔案不存在則備用市場主流名單
+    return ["tse_2330.tw", "tse_2317.tw", "tse_2454.tw", "tse_3231.tw", "tse_2382.tw"]
+
+# ==================== 即時盤況與買賣力道 ====================
 def fetch_mis_quotes(stock_list):
-    """取得證交所 MIS 即時盤況"""
+    """取得 MIS 報價"""
     if not stock_list:
         return []
     stocks_query = "|".join(stock_list)
@@ -108,15 +166,22 @@ def fetch_mis_quotes(stock_list):
         pass
     return []
 
-# ==================== 策略一：開盤 15 分快沖邏輯 ====================
+def analyze_order_book_momentum(stock_data):
+    """計算外盤買單比率與多頭竭盡檢驗"""
+    ask_vols = [int(v) for v in stock_data.get("f", "").split("_") if v.isdigit()]
+    bid_vols = [int(v) for v in stock_data.get("g", "").split("_") if v.isdigit()]
+    total_depth = sum(ask_vols) + sum(bid_vols)
+    if total_depth == 0:
+        return 0.5, False
+    buy_ratio = sum(bid_vols) / total_depth
+    first_ask = ask_vols[0] if ask_vols else 0
+    avg_ask = (sum(ask_vols[1:]) / len(ask_vols[1:])) if len(ask_vols) > 1 else first_ask
+    is_exhaustion = (first_ask > avg_ask * 3) and (buy_ratio < 0.52)
+    return buy_ratio, is_exhaustion
+
+# ==================== 策略評估 ====================
 def evaluate_strategy_opening_rush(stock_data):
-    """
-    開盤 15 分快沖條件：
-    - 開盤跳空開高 (1.5% ~ 5.0%)
-    - 價格站穩開盤價之上 (紅K強勢)
-    - 距最高價 0.5% 內
-    - 外盤買盤佔比 >= 58%
-    """
+    """開盤 15 分快沖邏輯"""
     try:
         code = stock_data.get("c")
         name = stock_data.get("n")
@@ -133,16 +198,15 @@ def evaluate_strategy_opening_rush(stock_data):
         if yesterday_close <= 0 or open_p <= 0:
             return None
 
-        open_gap_pct = ((open_p - yesterday_close) / yesterday_close) * 100
+        open_gap = ((open_p - yesterday_close) / yesterday_close) * 100
         current_pct = ((current_price - yesterday_close) / yesterday_close) * 100
+        buy_ratio, is_exhaustion = analyze_order_book_momentum(stock_data)
 
-        ask_vols = [int(v) for v in stock_data.get("f", "").split("_") if v.isdigit()]
-        bid_vols = [int(v) for v in stock_data.get("g", "").split("_") if v.isdigit()]
-        total_depth = sum(ask_vols) + sum(bid_vols)
-        buy_ratio = (sum(bid_vols) / total_depth) if total_depth > 0 else 0.5
+        if is_exhaustion:
+            return None
 
         is_match = (
-            (1.5 <= open_gap_pct <= 5.0) and
+            (1.5 <= open_gap <= 5.0) and
             (current_price >= open_p) and
             (current_price >= high_p * 0.995) and
             (2.0 <= current_pct <= 6.5) and
@@ -164,22 +228,15 @@ def evaluate_strategy_opening_rush(stock_data):
                 "volume": total_vol,
                 "stop_loss": stop_loss,
                 "target_price": target_price,
-                "extra_info": f"開盤價 {open_p} 元｜外盤比 {round(buy_ratio*100, 1)}%",
+                "extra_info": f"外盤買力 {round(buy_ratio*100, 1)}%（紅K站穩開盤）",
                 "link": f"https://tw.stock.yahoo.com/quote/{code}"
             }
     except Exception:
         return None
     return None
 
-# ==================== 策略二：09:35 後主流壓縮突破邏輯 ====================
 def evaluate_strategy_trend_breakout(stock_data):
-    """
-    盤中主流突破條件：
-    - 完成 9:30 前沉澱驗證
-    - 價格貼近當日最高價 0.5% 內
-    - 漲幅介於 2.5% ~ 7.5%
-    - 買盤力道充足 (>= 55%)
-    """
+    """09:35 後主流突破邏輯"""
     try:
         code = stock_data.get("c")
         name = stock_data.get("n")
@@ -197,11 +254,10 @@ def evaluate_strategy_trend_breakout(stock_data):
             return None
 
         pct_change = ((current_price - yesterday_close) / yesterday_close) * 100
+        buy_ratio, is_exhaustion = analyze_order_book_momentum(stock_data)
 
-        ask_vols = [int(v) for v in stock_data.get("f", "").split("_") if v.isdigit()]
-        bid_vols = [int(v) for v in stock_data.get("g", "").split("_") if v.isdigit()]
-        total_depth = sum(ask_vols) + sum(bid_vols)
-        buy_ratio = (sum(bid_vols) / total_depth) if total_depth > 0 else 0.5
+        if is_exhaustion:
+            return None
 
         is_breakout = (current_price >= high_p * 0.995) and (2.5 <= pct_change <= 7.5) and (buy_ratio >= 0.55)
 
@@ -219,7 +275,7 @@ def evaluate_strategy_trend_breakout(stock_data):
                 "volume": total_vol,
                 "stop_loss": stop_loss,
                 "target_price": target_price,
-                "extra_info": f"大單外盤比 {round(buy_ratio*100, 1)}%",
+                "extra_info": f"大單外盤佔比 {round(buy_ratio*100, 1)}%（突破回檔支撐）",
                 "link": f"https://tw.stock.yahoo.com/quote/{code}"
             }
     except Exception:
@@ -228,19 +284,20 @@ def evaluate_strategy_trend_breakout(stock_data):
 
 # ==================== 推播發送模組 ====================
 def broadcast_signal(s):
-    """根據策略發送專屬 Telegram 訊息"""
+    """發送盤中符合進場標準的訊號推播"""
     if s["strategy"] == "開盤快沖":
         msg = (
             f"⚡ *【開盤 15 分快沖訊號】* ⚡\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"標的：*{s['code']} {s['name']}*\n"
+            f"標的：*{s['code']} {s['name']}* (作戰清單)\n"
             f"現價：`{s['price']}` 元 (漲幅 +{s['pct_change']}%)\n"
-            f"狀態：`{s['extra_info']}`\n"
+            f"力道：`{s['extra_info']}`\n"
             f"成交量：`{s['volume']:,}` 張\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🎯 *建議買進*：`{s['price']}` ～ `{round(s['price'] * 1.004, 2)}`\n"
-            f"🛑 *嚴格停損*：`{s['stop_loss']}` 元 (破開盤即撤)\n"
+            f"🛑 *嚴格停損*：`{s['stop_loss']}` 元 (跌破開盤價即撤)\n"
             f"🏆 *短沖停利*：`{s['target_price']}` 元\n"
+            f"⏱ *時間停損*：進場 8 分鐘內未拉開獲利建議平倉\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🔗 [點擊開啟 Yahoo 看盤確認]({s['link']})"
         )
@@ -249,7 +306,7 @@ def broadcast_signal(s):
         msg = (
             f"🔥 *【主流大單帶量突破{wave_str}】* 🔥\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"標的：*{s['code']} {s['name']}*（主流成交值榜）\n"
+            f"標的：*{s['code']} {s['name']}* (作戰清單)\n"
             f"現價：`{s['price']}` 元 (漲幅 +{s['pct_change']}%)\n"
             f"力道：`{s['extra_info']}`\n"
             f"成交量：`{s['volume']:,}` 張\n"
@@ -272,7 +329,7 @@ def generate_daily_review():
     today_df = df[df['date'] == today_str]
 
     if today_df.empty:
-        msg = f"📋 *【每日當沖交易復盤報告】* ({today_str})\n今日全市場均未觸發符合條件之標的，保持空手紀律。"
+        msg = f"📋 *【每日當沖交易復盤報告】* ({today_str})\n今日作戰清單中均未出現符合標準之進場訊號，嚴守紀律空手觀望。"
         send_telegram_message(msg)
         return
 
@@ -282,7 +339,7 @@ def generate_daily_review():
     msg = (
         f"📋 *【每日當沖交易復盤報告】* ({today_str})\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"今日共觸發 `{len(today_df)}` 檔交易訊號：\n\n"
+        f"今日作戰清單共觸發 `{len(today_df)}` 檔交易訊號：\n\n"
         f"⚡ *開盤 15 分快沖 ({len(rush_df)} 檔)*：\n"
     )
     if not rush_df.empty:
@@ -300,61 +357,35 @@ def generate_daily_review():
 
     msg += (
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💡 _提示：所有詳細五檔量能與價格已寫入資料庫，供覆盤手動交易勝率。_"
+        f"💡 _提示：所有詳細紀錄已寫入資料庫，供覆盤手動交易期望值。_"
     )
     send_telegram_message(msg)
 
-def generate_monthly_review():
-    """月底最後一天自動彙整整月歷史數據推播"""
-    today_dt = datetime.now(TW_TZ)
-    _, last_day = calendar.monthrange(today_dt.year, today_dt.month)
-    
-    # 判斷是否為月底當天收盤後
-    if today_dt.day == last_day and os.path.exists(SIGNALS_FILE):
-        df = pd.read_csv(SIGNALS_FILE)
-        current_month = today_dt.strftime("%Y-%m")
-        month_df = df[df['date'].str.startswith(current_month)]
-        
-        if month_df.empty:
-            return
-
-        total_alerts = len(month_df)
-        rush_count = len(month_df[month_df['strategy'] == "開盤快沖"])
-        trend_count = len(month_df[month_df['strategy'] == "主流突破"])
-        top_symbol = month_df['code'].mode()[0] if not month_df.empty else "N/A"
-        avg_pct = round(month_df['pct_change'].mean(), 2)
-
-        summary_msg = (
-            f"📊 *【{current_month} 月度當沖策略統計總覽】*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"• 本月觸發訊號總計：`{total_alerts}` 次\n"
-            f"  └ ⚡ 開盤快沖：`{rush_count}` 次\n"
-            f"  └ 🔥 主流突破：`{trend_count}` 次\n"
-            f"• 訊號觸發平均漲幅：`+{avg_pct}%`\n"
-            f"• 最常發動標的代號：`{top_symbol}`\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"詳細數據已歸檔於 `data/history/signals_history.csv`。"
-        )
-        send_telegram_message(summary_msg)
-
-# ==================== 主程式排程派發 ====================
+# ==================== 主流程調度 ====================
 def main():
     now_tw = datetime.now(TW_TZ)
     current_t = now_tw.time()
     today_str = now_tw.strftime("%Y-%m-%d")
 
-    # 週末不執行
     if now_tw.weekday() >= 5:
         return
 
-    # 收盤時段 (13:40 以後)：執行當日復盤與月底統計
-    if current_t >= dtime(13, 35):
-        print("[Info] 執行收盤復盤與月結結算...")
+    # 1. 盤後時段一 (13:40)：執行當日復盤
+    if dtime(13, 35) <= current_t <= dtime(14, 30):
+        print("[Info] 執行收盤復盤報告...")
         generate_daily_review()
-        generate_monthly_review()
         return
 
-    # 讀取今日歷史推播狀態 (支援 45 分鐘冷卻與二次突破)
+    # 2. 盤後時段二 (15:30)：產出並推播明日作戰清單
+    if current_t >= dtime(15, 30):
+        print("[Info] 產出並推播明日作戰清單...")
+        generate_and_broadcast_tomorrow_watchlist()
+        return
+
+    # 3. 盤中交易時段：載入作戰清單並執行訊號監控
+    targets = load_today_watchlist()
+    quotes = fetch_mis_quotes(targets)
+
     recent_alerts = {}
     if os.path.exists(SIGNALS_FILE):
         try:
@@ -372,25 +403,20 @@ def main():
         except Exception:
             pass
 
-    # 籌碼過濾與主流股票清單取得
-    risk_stocks = fetch_risk_stocks_filter()
-    targets = get_top_market_value_stocks(risk_stocks, top_n=35)
-    quotes = fetch_mis_quotes(targets)
-
     signals_to_save = []
 
-    # 時段一：09:03 ~ 09:18（專做開盤 15 分快沖）
+    # 盤中時段 A：09:03 ~ 09:18（開盤 15 分快沖）
     if dtime(9, 3) <= current_t <= dtime(9, 18):
         for q in quotes:
             res = evaluate_strategy_opening_rush(q)
             if res:
                 code_str = str(res['code'])
-                if code_str not in recent_alerts:  # 開盤快沖當天只推一次
+                if code_str not in recent_alerts:
                     signals_to_save.append(res)
                     broadcast_signal(res)
                     recent_alerts[code_str] = {"time": now_tw, "price": res['price'], "count": 1}
 
-    # 時段二：09:35 ~ 13:15（專做主流壓縮突破）
+    # 盤中時段 B：09:35 ~ 13:15（主流壓縮突破）
     elif dtime(9, 35) <= current_t <= dtime(13, 15):
         for q in quotes:
             res = evaluate_strategy_trend_breakout(q)
@@ -402,7 +428,6 @@ def main():
                     last_info = recent_alerts[code_str]
                     round_num = last_info["count"] + 1
                     elapsed_min = (now_tw - last_info['time']).total_seconds() / 60
-                    # 需冷卻 45 分鐘以上且突破前次價格
                     if elapsed_min < 45 or res['price'] <= last_info['price']:
                         allow_alert = False
 
@@ -412,7 +437,6 @@ def main():
                     broadcast_signal(res)
                     recent_alerts[code_str] = {"time": now_tw, "price": res['price'], "count": round_num}
 
-    # 保存當批訊號至資料庫
     if signals_to_save:
         os.makedirs(DATA_DIR, exist_ok=True)
         file_exists = os.path.isfile(SIGNALS_FILE)
