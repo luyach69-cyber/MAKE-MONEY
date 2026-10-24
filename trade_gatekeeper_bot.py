@@ -1,24 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-台股當沖訊號機器人 v4 (小哥體系轉折與動能竭盡精準版)
+台股當沖雙引擎旗艦版 (Turnaround & Exhaustion 轉折精準版)
 
-核心優化亮點:
-  1. 波動壓縮後噴發 (Squeeze Breakout): 識別「長時間盤整窄幅壓縮後的首度突破」，避開高檔洗盤。
-  2. VWAP 量加權均價線與通道高低位: 嚴格過濾正乖離 > 2.2% 的過熱追高陷阱。
-  3. 大盤加權指數 (tse_t00.tw) 多空共振濾網: 盤面轉弱時嚴格禁止做多突破。
-  4. 避開垃圾洗盤時段: 10:30 ~ 11:20 流動性真空期禁止開新倉。
-  5. 獨創「主力熄燈 / 動能竭盡」出場提醒:
-     對盤中已持有的部位，當偵測到「賣一巨單壓頂 + 委買比率潰散 + 衝高拉回」時，
-     立即發送 Telegram 轉折警告，提示交易員提早獲利落袋或保本出場！
-  6. 完整結果追蹤、保本停損推升、R倍數損益結算與每日/月度勝率統計覆盤。
-
-用法:
-  python daytrade_bot.py                 單次執行 (Cron / GitHub Actions)
-  python daytrade_bot.py --loop          常駐輪詢 (推薦, 本機/VPS, 間隔 15 秒)
-  python daytrade_bot.py --report        輸出累計勝率/期望值報告 (--days 30, --send 同步推播)
-  python daytrade_bot.py --finalize      手動結算今日或指定日期 (--finalize 2026-10-21)
-  python daytrade_bot.py --build-watchlist 立即建立明日作戰清單
-  python daytrade_bot.py --check-api     檢查資料來源與欄位是否正常
+核心模組:
+  1. 盤前/盤後高周轉率與大震幅選股 (動態保底名單，杜絕 0 檔作戰清單)
+  2. 09:03 ~ 09:18 開盤快沖引擎 (跳空、紅K站穩開盤價、外盤吃單)
+  3. 09:35 ~ 13:15 主流壓縮突破 (VWAP 均價線支撐、排除正乖離 > 2.2% 追高陷阱)
+  4. 避開 10:30 ~ 11:20 垃圾洗盤泥沼時段 (禁止開新倉)
+  5. 主力熄燈轉折預警 (Exhaustion Alert: 賣一巨單壓頂 + 買單比率潰散 + 衝高拉回)
+  6. 移動保本防守 (Trailing Stop) 與 8~10 分鐘時間停損 (Time Stop)
+  7. 加權指數 (tse_t00.tw) 共振防護
+  8. 內建輕量 HTTP Keep-Alive 伺服器 (防止 Render 等雲端平台休眠)
 """
 import os
 import sys
@@ -30,6 +22,8 @@ import html
 import shutil
 import argparse
 import traceback
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date, time as dtime, timedelta
 
 import pandas as pd
@@ -38,9 +32,10 @@ import requests
 
 TW_TZ = pytz.timezone("Asia/Taipei")
 
-# ==================== 設定 ====================
+# ==================== 環境變數與路徑設定 ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+PORT = int(os.getenv("PORT", "10000"))
 
 DATA_DIR = os.getenv("DATA_DIR", "data/history")
 SIGNALS_FILE = os.path.join(DATA_DIR, "signals_history.csv")
@@ -55,27 +50,30 @@ FEE_DISCOUNT = float(os.getenv("FEE_DISCOUNT", "0.6"))
 DAYTRADE_TAX = float(os.getenv("DAYTRADE_TAX", "0.0015"))
 SLIPPAGE = float(os.getenv("SLIPPAGE", "0.0005"))
 
-# 選股條件
+# 選股與風控條件
 MIN_PRICE = 25.0
 MIN_LOTS = 2000
-MIN_AMPLITUDE_PCT = 3.0          # 前一日振幅門檻
-WATCHLIST_SIZE = 30
-DAYTRADE_RATIO_MAX = 45.0        # 當沖比 >= 此值視為過熱
+MIN_AMPLITUDE_PCT = 3.5          # 震幅門檻 (會動才有空間)
+WATCHLIST_SIZE = 25
+DAYTRADE_RATIO_MAX = 50.0        # 當沖比上限門檻
 
-# 乖離與停損設定
+# 乖離率與停損參數
 MAX_VWAP_BIAS = 2.2              # 正乖離大於 2.2% 視為過熱力竭, 嚴禁追高
 MIN_RISK_RUSH = 0.008
 MIN_RISK_TREND = 0.010
 
-UA = {"User-Agent": "Mozilla/5.0 (compatible; daytrade-bot/4.0)"}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; daytrade-bot/5.0)"}
 TWSE_DAY_ALL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TWSE_NOTICE = "https://openapi.twse.com.tw/v1/announcement/notice"
 TWSE_DAYTRADE_LIST = "https://openapi.twse.com.tw/v1/exchangeReport/TWTB4U"
 TWSE_DAYTRADE_STATS = "https://www.twse.com.tw/rwd/zh/dayTrading/TWTB4U"
 TPEX_DAY_ALL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 
-INDEX_SYMBOL = "tse_t00.tw"
-FALLBACK_WATCH = ["tse_2330.tw", "tse_2317.tw", "tse_2454.tw", "tse_3231.tw", "tse_2382.tw"]
+INDEX_SYMBOL = "tse_t00.tw"      # 加權指數代碼
+FALLBACK_WATCH = [
+    "tse_2330.tw", "tse_2317.tw", "tse_2454.tw", "tse_3231.tw", "tse_2382.tw",
+    "tse_2603.tw", "tse_3037.tw", "tse_3653.tw", "tse_2609.tw", "otc_8069.tw"
+]
 
 SIGNAL_COLUMNS = [
     "signal_id", "strategy", "date", "time", "market", "code", "name", "price", "pct_change",
@@ -87,6 +85,28 @@ RESULT_COLUMNS = [
     "outcome", "exit_price", "gross_pct", "cost_pct", "net_pct", "risk_pct", "r_multiple",
     "touched_target", "touched_stop", "first_touch", "close_price", "note",
 ]
+
+
+# ==================== 輕量 Keep-Alive 伺服器 (防止雲端休眠) ====================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(f"Daytrade Bot Engine Live: {now_tw():%Y-%m-%d %H:%M:%S}\n".encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass  # 靜音 HTTP 日誌
+
+
+def start_health_server():
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        log(f"[Info] 雲端 Keep-Alive HTTP 伺服器已在連接埠 {PORT} 啟動")
+    except Exception as e:
+        log(f"[Warn] HTTP 伺服器啟動失敗: {e}")
 
 
 # ==================== 基礎工具 ====================
@@ -251,7 +271,7 @@ def http_get_json(url, retries=2, timeout=12, **kw):
     return None
 
 
-# ==================== 盤後資料與籌碼過濾 ====================
+# ==================== 盤後資料與高周轉/動能選股 ====================
 def fetch_twse_daily():
     data = http_get_json(TWSE_DAY_ALL, timeout=20)
     if not isinstance(data, list) or not data:
@@ -352,7 +372,7 @@ def fetch_risk_filters(data_date):
 def generate_watchlist(require_date=None, only_if_newer=False, announce=True):
     rows, data_date = fetch_twse_daily()
     if not rows or not data_date:
-        alert_once("day_all_fail", "STOCK_DAY_ALL 取得失敗或無資料, 無法建立作戰清單")
+        alert_once("day_all_fail", "STOCK_DAY_ALL 取得失敗或無資料, 啟動備用名單")
         return False
     if require_date and data_date != require_date:
         log(f"[Info] 上市日成交資料日期為 {data_date}, 尚未更新到 {require_date}, 稍後重試")
@@ -371,6 +391,8 @@ def generate_watchlist(require_date=None, only_if_newer=False, announce=True):
 
     excluded, allow, dt_shares = fetch_risk_filters(data_date)
     cands = []
+    fallback_ranks = []
+
     for r in rows:
         code = r["code"]
         if not (len(code) == 4 and code.isdigit()) or code.startswith("0") or r["name"].endswith("-DR"):
@@ -385,6 +407,14 @@ def generate_watchlist(require_date=None, only_if_newer=False, announce=True):
         if ref <= 0:
             continue
         amp = (r["high"] - r["low"]) / ref * 100
+
+        # 保底池: 按成交金額排序備選
+        fallback_ranks.append({
+            "market": r["market"], "code": code, "name": r["name"], "close": r["close"],
+            "pct_change": round(r["change"] / ref * 100, 2), "amplitude": round(amp, 2),
+            "daytrade_ratio": None, "val": r["value"], "vol": int(r["lots"])
+        })
+
         if amp < MIN_AMPLITUDE_PCT:
             continue
         ratio = None
@@ -392,16 +422,26 @@ def generate_watchlist(require_date=None, only_if_newer=False, announce=True):
             ratio = dt_shares[code] / r["vol_shares"] * 100
             if ratio >= DAYTRADE_RATIO_MAX:
                 continue
+
         cands.append({
             "market": r["market"], "code": code, "name": r["name"], "close": r["close"],
             "pct_change": round(r["change"] / ref * 100, 2), "amplitude": round(amp, 2),
             "daytrade_ratio": None if ratio is None else round(ratio, 1),
             "val": r["value"], "vol": int(r["lots"])
         })
+
     cands.sort(key=lambda x: x["val"], reverse=True)
-    watch = cands[:WATCHLIST_SIZE]
+    fallback_ranks.sort(key=lambda x: x["val"], reverse=True)
+
+    # 動態保底邏輯: 若嚴選條件產出小於 5 檔，自動以市場最大成交金額主流標的補足
+    if len(cands) < 5:
+        log(f"[Warn] 嚴格篩選僅 {len(cands)} 檔，啟動成交值前 25 大自動保底機制")
+        watch = fallback_ranks[:WATCHLIST_SIZE]
+    else:
+        watch = cands[:WATCHLIST_SIZE]
+
     if not watch:
-        alert_once("empty_watch", "篩選後作戰清單為空, 請檢查篩選條件與資料來源")
+        alert_once("empty_watch", "篩選後作戰清單仍為空, 請檢查資料庫")
         return False
 
     save_json(WATCHLIST_FILE, {
@@ -411,17 +451,19 @@ def generate_watchlist(require_date=None, only_if_newer=False, announce=True):
     })
     if announce:
         msg = (f"🎯 <b>【明日當沖精選作戰清單】</b>(資料日 {data_date})\n━━━━━━━━━━━━━━━━━━\n"
-               f"成交值排序, 已排除注意股、當沖過熱、ETF, 且振幅 ≥ {MIN_AMPLITUDE_PCT}%:\n\n")
+               f"高周轉與大震幅嚴選, 已排除注意股與當沖過熱 (≥ {MIN_AMPLITUDE_PCT}%):\n\n")
         for i, it in enumerate(watch[:10], 1):
             mk = "櫃" if it["market"] == "otc" else "市"
+            dt_str = f"｜沖 {it['daytrade_ratio']}%" if it.get("daytrade_ratio") else ""
             msg += (f"{i}. <b>{esc(it['code'])} {esc(it['name'])}</b>({mk})｜收 <code>{it['close']}</code> "
-                    f"({it['pct_change']:+}%)｜量 <code>{it['vol']:,}</code> 張\n")
+                    f"({it['pct_change']:+}%)｜量 <code>{it['vol']:,}</code> 張{dt_str}\n")
         if len(watch) > 10:
             msg += f"<i>...另有 {len(watch) - 10} 檔已列入明日監控池</i>\n"
-        msg += ("━━━━━━━━━━━━━━━━━━\n📌 <b>明日作戰準則</b>:\n"
-                "• 09:03～09:18 僅針對「跳空開高＋不破開盤」執行快沖\n"
-                "• 09:35～10:30 主流壓縮突破、回踩VWAP支撐進場\n"
-                "• 10:30～11:20 洗盤泥沼時段禁止開新倉")
+        msg += ("━━━━━━━━━━━━━━━━━━\n📌 <b>作戰紀律準則</b>:\n"
+                "• 09:03～09:18 僅針對「跳空開高＋紅K不破開盤」執行快沖\n"
+                "• 09:35～10:30 主流回踩VWAP有撐、過前高突破進場\n"
+                "• 10:30～11:20 洗盤泥沼時段禁止開新倉\n"
+                "• 盤中遇主力熄燈(賣單壓頂)果斷獲利出場")
         send_telegram_message(msg)
     return True
 
@@ -437,7 +479,7 @@ def load_watchlist():
         if dd and (now_tw().date() - date.fromisoformat(dd)).days > 5:
             alert_once("stale_watch", f"作戰清單已過期(資料日 {dd}), 請檢查盤後建檔流程")
         return [f"{it.get('market', 'tse')}_{it['code']}.tw" for it in items]
-    alert_once("no_watchlist", "找不到作戰清單, 改用備用名單")
+    alert_once("no_watchlist", "找不到作戰清單, 啟用保底主流核心名單")
     return list(FALLBACK_WATCH)
 
 
@@ -524,7 +566,7 @@ def analyze_order_book(q):
     avg_rest_ask = sum(rest_asks) / len(rest_asks) if rest_asks else first_ask
     avg_rest_bid = sum(rest_bids) / len(rest_bids) if rest_bids else first_bid
 
-    # 多頭力竭: 賣一異常龐大 (壓頂) 且買盤比率萎縮
+    # 多頭力竭: 賣一異常龐大 (壓頂出貨) 且買盤比率萎縮
     is_exhausted = (first_ask > avg_rest_ask * 3.2) and (share < 0.50)
 
     structure = "中性"
@@ -534,21 +576,6 @@ def analyze_order_book(q):
         structure = "健康吃單(下虛上實)"
 
     return share, is_exhausted, structure
-
-
-def get_market_index_status():
-    """加權指數監控 (tse_t00.tw)"""
-    try:
-        raw = fetch_mis_quotes([INDEX_SYMBOL])
-        if raw:
-            q = parse_quote(raw[0])
-            if q and q["last"] and q["prev"]:
-                pct = (q["last"] - q["prev"]) / q["prev"] * 100
-                is_weak = (pct < -0.3) or (q["open"] and q["last"] < q["open"])
-                return {"valid": True, "pct": round(pct, 2), "weak": is_weak, "last": q["last"]}
-    except Exception as e:
-        log(f"[Warn] 讀取加權指數失敗: {e}")
-    return {"valid": False, "pct": 0.0, "weak": False, "last": 0.0}
 
 
 # ==================== 策略評估 ====================
@@ -568,7 +595,7 @@ def calculate_vwap_bias(p, o, h, l, vwap):
 
 
 def evaluate_opening_rush(q, market_status):
-    """開盤 15 分快沖邏輯"""
+    """09:03 ~ 09:18 開盤快沖"""
     p, o, h, l, y = q["last"], q["open"], q["high"], q["low"], q["prev"]
     if not p or p <= 0 or not o or not h or not y or y <= 0 or o <= 0:
         return None
@@ -609,7 +636,7 @@ def evaluate_opening_rush(q, market_status):
 
 
 def evaluate_trend_breakout(q, market_status):
-    """09:35 ~ 13:15 波動壓縮後首度突破邏輯 (Squeeze Breakout)"""
+    """09:35 ~ 13:15 壓縮後帶量突破"""
     p, o, h, l, y = q["last"], q["open"], q["high"], q["low"], q["prev"]
     if not p or p < MIN_PRICE or not h or not l or not y or y <= 0:
         return None
@@ -623,20 +650,17 @@ def evaluate_trend_breakout(q, market_status):
     if exhausted or structure == "誘多疑慮(下實上虛)":
         return None
 
-    # 基礎突破門檻
     if not (p >= h * 0.995 and 2.5 <= pct <= 7.5 and share >= 0.55):
         return None
 
     ref_vwap, bias = calculate_vwap_bias(p, o, h, l, q["vwap"])
 
-    # 1. VWAP 正乖離門檻: 避免追在天花板
     if bias > MAX_VWAP_BIAS:
         log(f"[Skip] {q['code']} 創高但 VWAP 正乖離過大 ({bias}% > {MAX_VWAP_BIAS}%), 放棄進場")
         return None
 
-    # 2. 波動壓縮驗證: 當日早盤低點到突破前高點，振幅不可過大失控 (壓縮後初噴最佳)
     intraday_swing = (h - l) / l * 100
-    if intraday_swing > 9.0:  # 已噴出過度, 容易洗盤
+    if intraday_swing > 9.0:
         return None
 
     stop = round_tick(min(max(l, p * 0.978), p * (1 - MIN_RISK_TREND)), "down")
@@ -726,7 +750,7 @@ def build_recent_alerts(today):
     return alerts
 
 
-# ==================== 結果追蹤與動能竭盡 (熄燈) 警示 ====================
+# ==================== 部位狀態與主力熄燈 (轉折預警) ====================
 def position_from_signal(d):
     f = lambda k: to_float(d.get(k))
     return {
@@ -755,7 +779,7 @@ def ensure_positions_state(day, state):
 
 def update_positions_and_check_exhaustion(parsed, state):
     """
-    更新在倉部位，並檢查是否出現「主力熄燈 / 動能竭盡」轉折點
+    即時更新持倉狀態，並觸發「主力熄燈 / 動能竭盡」轉折通知
     """
     qmap = {q["code"]: q for q in parsed}
     exhaustion_alerts = []
@@ -771,24 +795,23 @@ def update_positions_and_check_exhaustion(parsed, state):
         if price is None:
             continue
 
-        # 1. 保本停損推升: 獲利達 +1.0% 時將停損移動至成本價
+        # 1. 保本停損推升: 獲利達到 +1.0% 時自動將停損移動至成本價
         if not p.get("trailed_to_be") and price >= p["entry"] * 1.010:
             p["stop"] = p["entry"]
             p["trailed_to_be"] = True
 
         # 2. 熄燈轉折預警 (動能竭盡偵測):
-        # 條件: 曾有獲利、股價自高點拉回 > 0.8%、五檔買單佔比跌破 48% 且賣一異常厚重
         share, is_exhausted, _ = analyze_order_book(q)
         high_p = q.get("high") or p["entry"]
-        pullback_from_high = (high_p - price) / high_p * 100 if high_p > 0 else 0
+        pullback = (high_p - price) / high_p * 100 if high_p > 0 else 0
 
-        if not p.get("warned_exhaustion") and price > p["entry"] and pullback_from_high >= 0.8:
+        if not p.get("warned_exhaustion") and price > p["entry"] and pullback >= 0.8:
             if is_exhausted or share < 0.46:
                 p["warned_exhaustion"] = True
                 exhaustion_alerts.append({
                     "code": p["code"], "name": p["name"], "entry": p["entry"], "price": price,
                     "gain_pct": round((price - p["entry"]) / p["entry"] * 100, 2),
-                    "pullback": round(pullback_from_high, 2),
+                    "pullback": round(pullback, 2),
                     "link": f"https://tw.stock.yahoo.com/quote/{p['code']}"
                 })
 
@@ -804,389 +827,3 @@ def update_positions_and_check_exhaustion(parsed, state):
             p["touched_target"] = True
         if dl is not None and q["low"] is not None and q["low"] < dl and q["low"] <= p["stop"]:
             p["touched_stop"] = True
-
-        new = {k for k, b, a in (("target", before[0], p["touched_target"]), ("stop", before[1], p["touched_stop"]))
-               if a and not b}
-        if p.get("first_touch") is None and len(new) == 1 and not any(before):
-            p["first_touch"] = new.pop()
-
-    # 發送主力熄燈轉折警告
-    for it in exhaustion_alerts:
-        msg = (
-            f"💡 <b>【動能竭盡 / 主力熄燈轉折警示】</b> ⚠️\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"標的: <b>{esc(it['code'])} {esc(it['name'])}</b>\n"
-            f"進場參考: <code>{it['entry']}</code> 元 ｜ 現價: <code>{it['price']}</code> 元 ({it['gain_pct']:+}%)\n"
-            f"轉折跡象: 自高點回撤 <code>{it['pullback']}%</code>，五檔買力明顯熄火、賣壓壓頂\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 <b>建議處置</b>: 買盤動能衰退，請嚴守保本或<b>提早分批獲利了結</b>，切勿抱到虧損！\n"
-            f"🔗 <a href=\"{esc(it['link'])}\">點擊開啟 Yahoo 看盤確認</a>"
-        )
-        send_telegram_message(msg)
-
-    return state
-
-
-def compute_trade_pnl(entry, exit_price, stop):
-    e_eff, x_eff = entry * (1 + SLIPPAGE), exit_price * (1 - SLIPPAGE)
-    gross = (x_eff - e_eff) / e_eff * 100
-    cost = (2 * FEE_RATE * FEE_DISCOUNT + DAYTRADE_TAX) * 100
-    net = gross - cost
-    risk = (entry - stop) / entry * 100
-    return round(gross, 3), round(cost, 3), round(net, 3), round(risk, 3), (round(net / risk, 2) if risk > 0 else None)
-
-
-def resolve_outcome(p, close):
-    tt, ts, first = p["touched_target"], p["touched_stop"], p.get("first_touch")
-    legacy = p.get("day_high_at_signal") is None
-    note = ""
-    if tt and ts:
-        if first == "target":
-            outcome, exit_p = "WIN", p["target"]
-        elif first == "stop":
-            outcome, exit_p = "LOSS", p["stop"]
-        else:
-            outcome, exit_p = "AMBIGUOUS", p["stop"]
-            note = "停損與停利皆被觸及且無法判定先後, 保守以停損計"
-    elif tt:
-        outcome, exit_p = "WIN", p["target"]
-    elif ts:
-        outcome, exit_p = "LOSS", p["stop"]
-        if p.get("trailed_to_be"):
-            note = "觸發保本出場"
-    elif legacy:
-        outcome, exit_p, note = "NO_DATA", None, "舊版訊號缺少進場當下極值, 不計入統計"
-    else:
-        outcome, exit_p = "TIME_EXIT", close
-        note = "未觸及停損/停利, 以收盤價出場"
-
-    row = {
-        "signal_id": p["signal_id"], "date": p["date"], "time": p["time"], "strategy": p["strategy"],
-        "market": p["market"], "code": p["code"], "name": p["name"], "entry": p["entry"], "stop": p["stop"],
-        "target": p["target"], "outcome": outcome, "touched_target": tt, "touched_stop": ts,
-        "first_touch": first or "", "close_price": close, "note": note
-    }
-    if exit_p is not None:
-        g, c, n, r, rm = compute_trade_pnl(p["entry"], exit_p, p["original_stop"] or p["stop"])
-        row.update({"exit_price": exit_p, "gross_pct": g, "cost_pct": c, "net_pct": n, "risk_pct": r, "r_multiple": rm})
-    return row
-
-
-def finalize_results(day):
-    state = ensure_positions_state(day, load_json(STATE_FILE, {}))
-    pending = {k: p for k, p in state.items() if p["date"] == day and not p.get("resolved")}
-    if pending:
-        ex = sorted({f"{p['market']}_{p['code']}.tw" for p in pending.values()})
-        parsed = [q for q in (parse_quote(x) for x in fetch_mis_quotes(ex)) if q]
-        update_positions_and_check_exhaustion(parsed, state)
-        qmap = {q["code"]: q for q in parsed}
-        rows = []
-        for p in pending.values():
-            q = qmap.get(p["code"])
-            if not q or q["last"] is None:
-                log(f"[Warn] {p['code']} 無收盤價, 稍後重試")
-                continue
-            rows.append(resolve_outcome(p, q["last"]))
-            p["resolved"] = True
-        append_rows(RESULTS_FILE, RESULT_COLUMNS, rows)
-    cutoff = (now_tw().date() - timedelta(days=3)).isoformat()
-    state = {k: v for k, v in state.items() if not (v.get("resolved") and v["date"] < cutoff)}
-    save_json(STATE_FILE, state)
-
-
-# ==================== 勝率統計 ====================
-def wilson_ci(k, n, z=1.96):
-    if n == 0:
-        return 0.0, 0.0
-    p = k / n
-    den = 1 + z * z / n
-    centre = (p + z * z / (2 * n)) / den
-    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
-    return centre - half, centre + half
-
-
-def load_results_df(days=0, day=None):
-    if not os.path.exists(RESULTS_FILE):
-        return pd.DataFrame()
-    df = pd.read_csv(RESULTS_FILE, encoding="utf-8-sig", dtype={"code": str})
-    df = df[df["outcome"].isin(["WIN", "LOSS", "AMBIGUOUS", "TIME_EXIT"])].copy()
-    df["net_pct"] = pd.to_numeric(df["net_pct"], errors="coerce")
-    df = df.dropna(subset=["net_pct"])
-    if day:
-        df = df[df["date"] == day]
-    elif days > 0:
-        df = df[df["date"] >= (now_tw().date() - timedelta(days=days)).isoformat()]
-    return df.sort_values(["date", "time"]).reset_index(drop=True)
-
-
-def compute_stats(df):
-    n = len(df)
-    if n == 0:
-        return None
-    net = df["net_pct"]
-    wins, losses = net[net > 0], net[net <= 0]
-    avg_win = wins.mean() if len(wins) else 0.0
-    avg_loss = -losses.mean() if len(losses) else 0.0
-    loss_sum = -losses.sum()
-    lo, hi = wilson_ci(len(wins), n)
-    std = net.std(ddof=1) if n > 1 else 0.0
-    equity = net.cumsum()
-    streak = cur = 0
-    for v in net:
-        cur = cur + 1 if v <= 0 else 0
-        streak = max(streak, cur)
-    return {
-        "n": n, "win_rate": len(wins) / n, "ci": (lo, hi), "avg_win": avg_win, "avg_loss": avg_loss,
-        "expectancy": net.mean(), "profit_factor": (wins.sum() / loss_sum) if loss_sum > 0 else float("inf"),
-        "breakeven_wr": (avg_loss / (avg_win + avg_loss)) if (avg_win + avg_loss) > 0 else None,
-        "t_stat": (net.mean() / (std / math.sqrt(n))) if std > 0 else 0.0, "total": net.sum(),
-        "max_dd": (equity.cummax() - equity).max(), "max_loss_streak": streak,
-        "outcomes": df["outcome"].value_counts().to_dict()
-    }
-
-
-def format_stats(s, title):
-    if not s:
-        return [title, "  尚無已結算的訊號"]
-    pf = "∞" if s["profit_factor"] == float("inf") else f"{s['profit_factor']:.2f}"
-    be = "-" if s["breakeven_wr"] is None else f"{s['breakeven_wr'] * 100:.1f}%"
-    lines = [
-        title,
-        f"  樣本數: {s['n']}   結果分布: {s['outcomes']}",
-        f"  勝率(淨損益>0): {s['win_rate'] * 100:.1f}%   95%信賴區間: {s['ci'][0] * 100:.0f}%~{s['ci'][1] * 100:.0f}%",
-        f"  平均獲利 {s['avg_win']:+.2f}%  平均虧損 -{s['avg_loss']:.2f}%  損益兩平勝率 {be}",
-        f"  期望值(每筆淨%): {s['expectancy']:+.3f}%   獲利因子: {pf}   t值: {s['t_stat']:.2f}",
-        f"  累計淨損益: {s['total']:+.2f}%   最大回落: {s['max_dd']:.2f}%   最長連虧: {s['max_loss_streak']}"
-    ]
-    if s["n"] < 100:
-        lines.append(f"  ⚠ 樣本僅 {s['n']} 筆(<100), 以上數字不具統計意義, 請勿據此調參或加碼")
-    elif abs(s["t_stat"]) < 2:
-        lines.append("  ⚠ |t| < 2: 期望值與 0 沒有顯著差異")
-    return lines
-
-
-def build_report(days=0):
-    df = load_results_df(days=days)
-    label = f"近 {days} 天" if days else "全部"
-    lines = format_stats(compute_stats(df), f"【累計績效 - {label}】")
-    if len(df):
-        for strat, g in df.groupby("strategy"):
-            lines += [""] + format_stats(compute_stats(g), f"【{strat}】")
-    total = len(read_signals())
-    lines += ["", f"signals_history.csv 共 {total} 筆訊號, 其中 {len(df)} 筆已納入結果統計"]
-    lines.append(f"成本假設: 手續費 {FEE_RATE * 100:.4f}%×{FEE_DISCOUNT} 雙邊 + 證交稅 {DAYTRADE_TAX * 100:.2f}% "
-                 f"+ 單邊滑價 {SLIPPAGE * 100:.2f}%")
-    return lines
-
-
-def finalize_and_review(today):
-    sigs = [d for d in read_signals() if d.get("date") == today]
-    probe = [q for q in (parse_quote(x) for x in fetch_mis_quotes(["tse_2330.tw"])) if q]
-    if not probe or probe[0]["date"] != today.replace("-", ""):
-        log("[Info] 查無今日行情 (休市日或 MIS 暫時無回應)")
-        return not sigs
-    finalize_results(today)
-    df_today = load_results_df(day=today)
-    lines = [f"今日訊號 {len(sigs)} 檔, 已結算 {len(df_today)} 檔"]
-    if len(df_today):
-        for _, r in df_today.iterrows():
-            lines.append(f"{r['outcome']:<9} {r['code']} {r['name']}  進{r['entry']}→出{r['exit_price']}  "
-                         f"淨{r['net_pct']:+.2f}%")
-        lines += [""] + format_stats(compute_stats(df_today), "【今日】")
-    elif not sigs:
-        lines.append("今日作戰清單未出現符合高勝率力道標準的訊號, 空手觀望保持紀律。")
-    lines += [""] + format_stats(compute_stats(load_results_df()), "【累計】")
-    send_telegram_message(f"📋 <b>每日當沖復盤</b> {esc(today)}\n<pre>{esc(chr(10).join(lines))}</pre>")
-    return True
-
-
-# ==================== 推播發送 ====================
-def broadcast_signal(s):
-    head = (f"標的: <b>{esc(s['code'])} {esc(s['name'])}</b> (作戰清單)\n"
-            f"現價: <code>{s['price']}</code> 元 (+{s['pct_change']}%)\n"
-            f"狀態: <code>{esc(s['extra_info'])}</code>\n成交量: <code>{s['volume']:,}</code> 張\n"
-            "━━━━━━━━━━━━━━━━━━\n")
-    link = f'🔗 <a href="{esc(s["link"])}">開啟 Yahoo 看盤確認</a>'
-    if s["strategy"] == "開盤快沖":
-        msg = ("⚡ <b>【開盤 15 分快沖訊號】</b> ⚡\n━━━━━━━━━━━━━━━━━━\n" + head +
-               f"🎯 <b>建議買進</b>: <code>{s['price']}</code> ～ <code>{round(s['price'] * 1.004, 2)}</code>\n"
-               f"🛑 <b>嚴格停損</b>: <code>{s['stop_loss']}</code> 元 (跌破開盤即撤)\n"
-               f"🏆 <b>短沖停利</b>: <code>{s['target_price']}</code> 元\n"
-               "⏱ <b>時間停損</b>: 進場 8 分鐘內未脫離成本區建議平倉\n"
-               "🛡 <b>保本防守</b>: 獲利達 +1.0% 時請將停損推至成本價\n"
-               "━━━━━━━━━━━━━━━━━━\n" + link)
-    else:
-        wave = int(to_float(s.get("wave"), 1) or 1)
-        wave_str = f" (第 {wave} 波發動)" if wave > 1 else ""
-        msg = (f"🔥 <b>【主流大單帶量突破{wave_str}】</b> 🔥\n━━━━━━━━━━━━━━━━━━\n" + head +
-               f"🎯 <b>建議掛單</b>: <code>{s['price']}</code> ～ <code>{round(s['price'] * 1.005, 2)}</code>\n"
-               f"🛑 <b>嚴守停損</b>: <code>{s['stop_loss']}</code> 元\n"
-               f"🏆 <b>波段停利</b>: <code>{s['target_price']}</code> 元 (風報比 1:2)\n"
-               "⏱ <b>時間風控</b>: 10 分鐘內未走出利潤建議平倉\n"
-               "🛡 <b>保本防守</b>: 獲利達 +1.0% 時請將停損推至成本價\n"
-               "━━━━━━━━━━━━━━━━━━\n" + link)
-    send_telegram_message(msg)
-
-
-# ==================== 主流程控制 ====================
-def run_intraday(now, today):
-    t = now.time()
-    if t < dtime(9, 0) or t > dtime(13, 30):
-        return
-
-    is_lunch_slump = (dtime(10, 30) <= t < dtime(11, 20))
-
-    watch_ex = load_watchlist()
-    state = ensure_positions_state(today, load_json(STATE_FILE, {}))
-    open_ex = {f"{p['market']}_{p['code']}.tw" for p in state.values() if p["date"] == today and not p.get("resolved")}
-
-    fetch_list = sorted(set(watch_ex) | open_ex | {INDEX_SYMBOL})
-    parsed = [q for q in (parse_quote(x) for x in fetch_mis_quotes(fetch_list)) if q]
-    if not parsed:
-        log("[Warn] MIS 沒有回傳任何行情")
-        return
-    if not any(q["date"] == today.replace("-", "") for q in parsed):
-        log("[Info] 非交易日或尚未開盤")
-        return
-
-    # 即時更新部位並檢查「主力熄燈 / 動能竭盡」轉折點
-    update_positions_and_check_exhaustion(parsed, state)
-    save_json(STATE_FILE, state)
-
-    idx_q = next((q for q in parsed if q["code"] == "t00"), None)
-    market_status = {"valid": False, "pct": 0.0, "weak": False}
-    if idx_q and idx_q["last"] and idx_q["prev"]:
-        idx_pct = (idx_q["last"] - idx_q["prev"]) / idx_q["prev"] * 100
-        market_status = {
-            "valid": True, "pct": round(idx_pct, 2),
-            "weak": (idx_pct < -0.3) or (idx_q["open"] and idx_q["last"] < idx_q["open"])
-        }
-
-    watch_codes = {e.split("_", 1)[1].split(".")[0] for e in watch_ex}
-    recent = build_recent_alerts(today)
-    new_signals = []
-
-    # 時段 A: 開盤快沖 (09:03 ~ 09:18)
-    if dtime(9, 3) <= t <= dtime(9, 18):
-        for q in parsed:
-            if q["code"] not in watch_codes or q["code"] in recent:
-                continue
-            s = evaluate_opening_rush(q, market_status)
-            if s:
-                new_signals.append(s)
-                recent[q["code"]] = {"time": now, "price": s["price"], "count": 1}
-
-    # 時段 B: 主流壓縮突破 (09:35 ~ 13:15, 排除 10:30 ~ 11:20 垃圾時間)
-    elif dtime(9, 35) <= t <= dtime(13, 15):
-        if is_lunch_slump:
-            log("[Info] 目前處於 10:30~11:20 洗盤泥沼時段, 暫停篩選新進場訊號")
-        else:
-            for q in parsed:
-                if q["code"] not in watch_codes:
-                    continue
-                s = evaluate_trend_breakout(q, market_status)
-                if not s:
-                    continue
-                last = recent.get(q["code"])
-                if last and ((now - last["time"]).total_seconds() / 60 < 45 or s["price"] <= last["price"]):
-                    continue
-                s["wave"] = (last["count"] + 1) if last else 1
-                new_signals.append(s)
-                recent[q["code"]] = {"time": now, "price": s["price"], "count": s["wave"]}
-
-    for s in new_signals:
-        state[s["signal_id"]] = position_from_signal(s)
-    save_json(STATE_FILE, state)
-    append_rows(SIGNALS_FILE, SIGNAL_COLUMNS, new_signals)
-    for s in new_signals:
-        broadcast_signal(s)
-
-
-def run_cycle():
-    now = now_tw()
-    today, t = now.strftime("%Y-%m-%d"), now.time()
-    if now.weekday() >= 5:
-        return
-    if t >= dtime(13, 35):
-        if not flag_done("review", today) and finalize_and_review(today):
-            mark_done("review", today)
-        if t >= dtime(15, 30) and not flag_done("watchlist", today):
-            if generate_watchlist(require_date=now.date()) is True:
-                mark_done("watchlist", today)
-        return
-    if dtime(8, 20) <= t < dtime(8, 55):
-        if not flag_done("catchup", today) and generate_watchlist(only_if_newer=True) in (True, "skip"):
-            mark_done("catchup", today)
-        return
-    run_intraday(now, today)
-
-
-def run_loop(interval):
-    ensure_signals_schema()
-    log(f"[Info] v4 轉折精準版常駐模式啟動, 盤中輪詢間隔 {interval} 秒")
-    while True:
-        try:
-            run_cycle()
-        except Exception as e:
-            log(f"[Error] 本輪執行失敗: {e}\n{traceback.format_exc()}")
-            alert_once("cycle_error", f"主迴圈發生例外: {e}")
-        t = now_tw().time()
-        time.sleep(interval if dtime(8, 58) <= t <= dtime(13, 31) else 60)
-
-
-def check_api():
-    def show(name, data):
-        if isinstance(data, list) and data:
-            print(f"[OK]   {name}: {len(data)} 筆\n       欄位 = {list(data[0].keys())}")
-        else:
-            print(f"[FAIL] {name}: 無資料")
-    show("TWSE STOCK_DAY_ALL", http_get_json(TWSE_DAY_ALL, retries=0, timeout=20))
-    show("TWSE notice(注意股)", http_get_json(TWSE_NOTICE, retries=0))
-    show("TWSE TWTB4U(可當沖清單)", http_get_json(TWSE_DAYTRADE_LIST, retries=0))
-    show("TPEx 日成交", http_get_json(TPEX_DAY_ALL, retries=0, timeout=20))
-    rows, d = fetch_twse_daily()
-    print(f"上市解析 {len(rows)} 檔, 資料日 {d}")
-    rows, d = fetch_tpex_daily()
-    print(f"上櫃解析 {len(rows)} 檔, 資料日 {d}")
-    base = d or now_tw().date()
-    print(f"當沖股數解析 {len(fetch_twse_daytrade_shares(base))} 檔")
-    idx_raw = fetch_mis_quotes([INDEX_SYMBOL])
-    if idx_raw:
-        q = parse_quote(idx_raw[0])
-        print(f"加權指數測試: {q['name']} ({q['code']}) 現價: {q['last']}")
-
-
-def main():
-    ap = argparse.ArgumentParser(description="台股當沖訊號機器人 v4 (小哥體系轉折與動能竭盡精準版)")
-    ap.add_argument("--loop", action="store_true", help="常駐輪詢模式")
-    ap.add_argument("--interval", type=int, default=15, help="常駐模式盤中輪詢秒數")
-    ap.add_argument("--report", action="store_true", help="輸出累計績效報告")
-    ap.add_argument("--days", type=int, default=0, help="報告只看最近 N 天")
-    ap.add_argument("--send", action="store_true", help="報告同步推送 Telegram")
-    ap.add_argument("--finalize", nargs="?", const="today", help="手動結算 (可指定 YYYY-MM-DD)")
-    ap.add_argument("--build-watchlist", action="store_true", help="立即建立作戰清單")
-    ap.add_argument("--check-api", action="store_true", help="檢查資料來源欄位")
-    a = ap.parse_args()
-
-    ensure_signals_schema()
-    if a.check_api:
-        check_api()
-    elif a.report:
-        lines = build_report(a.days)
-        print("\n".join(lines))
-        if a.send:
-            send_telegram_message(f"📊 <b>績效報告</b>\n<pre>{esc(chr(10).join(lines))}</pre>")
-    elif a.finalize:
-        day = now_tw().strftime("%Y-%m-%d") if a.finalize == "today" else a.finalize
-        finalize_results(day)
-        print("\n".join(format_stats(compute_stats(load_results_df(day=day)), f"【{day} 結算】")))
-    elif a.build_watchlist:
-        print("結果:", generate_watchlist())
-    elif a.loop:
-        run_loop(a.interval)
-    else:
-        run_cycle()
-
-
-if __name__ == "__main__":
-    main()
