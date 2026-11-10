@@ -1,16 +1,5 @@
-def run_trading_day():
-    print("=== 當沖選股推播與自動復盤系統 (公開資料正式版) ===")
-    init_db()
-    
-    # 測試發送一行確認連線
-    send_telegram_message("🔔 系統連線測試：GitHub Actions 已順利啟動並連通 Telegram！")
 """
-main.py - 公開資料全自動當沖選股、即時推播與盤後復盤系統
-整合來源：
-1. 證券交易所 (TWSE) 公開資料：盤前自動獲取外資與投信同步買超共識名單。
-2. Yahoo Finance (yfinance)：自動計算前一日 12:00~13:30 尾盤高低點 (支撐/壓力線) 與 5分K 走勢。
-3. 策略引擎 (strategy_engine.py)：開盤勢法 (強強開盤)、底底高、布林通道發散與大單動能檢驗。
-4. 推播與復盤 (notifier.py / review_analyzer.py)：即時 Telegram 訊號發送與盤後勝率統計。
+main.py - 公開資料全自動當沖選股、即時推播與盤後復盤系統 (含每日運作通知版)
 """
 
 import time
@@ -31,10 +20,6 @@ class PublicTWDataFetcher:
 
     @staticmethod
     def get_twse_institutional_consensus(top_n=30):
-        """
-        抓取證交所三大法人買賣超日報 (公開資料)
-        篩選外資與投信『同步買超』且買超張數名列前茅的標的
-        """
         url = "https://www.twse.com.tw/rwd/zh/fund/T86?response=json"
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -50,41 +35,38 @@ class PublicTWDataFetcher:
             rows = data["data"]
             df = pd.DataFrame(rows, columns=fields)
             
-            foreign_col = [c for c in df.columns if "外陸資" in c and "自營商" not in c][0]
-            trust_col = [c for c in df.columns if "投信" in c and "買賣超" in c][0]
+            foreign_cols = [c for c in df.columns if "外陸資" in c and "自營商" not in c]
+            trust_cols = [c for c in df.columns if "投信" in c and "買賣超" in c]
             
-            df["foreign_buy"] = df[foreign_col].astype(str).str.replace(",", "").astype(float)
-            df["trust_buy"] = df[trust_col].astype(str).str.replace(",", "").astype(float)
-            
-            # 外資投信同步買超條件
-            cond = (df["foreign_buy"] > 0) & (df["trust_buy"] > 0)
-            df_filtered = df[cond].copy()
-            df_filtered["total_inst_buy"] = df_filtered["foreign_buy"] + df_filtered["trust_buy"]
-            df_sorted = df_filtered.sort_values(by="total_inst_buy", ascending=False).head(top_n)
-            
-            for _, r in df_sorted.iterrows():
-                code = str(r["證券代號"]).strip()
-                name = str(r["證券名稱"]).strip()
-                if len(code) == 4 and code.isdigit():
-                    consensus_stocks.append({"stock_id": code, "stock_name": name})
+            if foreign_cols and trust_cols:
+                df["foreign_buy"] = df[foreign_cols[0]].astype(str).str.replace(",", "").astype(float)
+                df["trust_buy"] = df[trust_cols[0]].astype(str).str.replace(",", "").astype(float)
+                
+                cond = (df["foreign_buy"] > 0) & (df["trust_buy"] > 0)
+                df_filtered = df[cond].copy()
+                df_filtered["total_inst_buy"] = df_filtered["foreign_buy"] + df_filtered["trust_buy"]
+                df_sorted = df_filtered.sort_values(by="total_inst_buy", ascending=False).head(top_n)
+                
+                for _, r in df_sorted.iterrows():
+                    code = str(r["證券代號"]).strip()
+                    name = str(r["證券名稱"]).strip()
+                    if len(code) == 4 and code.isdigit():
+                        consensus_stocks.append({"stock_id": code, "stock_name": name})
         except Exception as e:
-            print(f"[提示] 擷取證交所法人買賣超資料略過或失敗: {e}")
+            print(f"[提示] 擷取證交所法人買賣超資料略過: {e}")
             
         return consensus_stocks
 
     @staticmethod
     def get_stock_levels_and_5m(stock_id: str, stock_name: str, trade_date: str):
-        """
-        透過 yfinance 抓取最近 5 天的 5分K 資料：
-        1. 計算前一日 12:00 ~ 13:30 尾盤高點 (壓力) 與低點 (支撐)
-        2. 取得今日 5分K 進行開盤勢法與技術指標判定
-        """
-        symbol = f"{stock_id}.TW"
+        # 上櫃代碼清單直接以 .TWO 抓取，其餘先試 .TW
+        otc_stocks = ["6274", "3450", "3533"]
+        symbol = f"{stock_id}.TWO" if stock_id in otc_stocks else f"{stock_id}.TW"
+        
         ticker = yf.Ticker(symbol)
         df = ticker.history(period="5d", interval="5m")
-        if df.empty:
-            symbol = f"{stock_id}.TWO"
-            ticker = yf.Ticker(symbol)
+        if df.empty and not symbol.endswith(".TWO"):
+            ticker = yf.Ticker(f"{stock_id}.TWO")
             df = ticker.history(period="5d", interval="5m")
             if df.empty:
                 return None, None
@@ -104,7 +86,7 @@ class PublicTWDataFetcher:
         prev_date = all_dates[-2]
         today_date = all_dates[-1]
 
-        # 1. 篩選昨日 12:00 ~ 13:30 尾盤區間計算撐壓
+        # 篩選昨日 12:00 ~ 13:30 尾盤區間計算撐壓
         df_prev_pm = df[(df["date_str"] == prev_date) & (df["time_str"] >= "12:00") & (df["time_str"] <= "13:30")]
         if df_prev_pm.empty:
             df_prev_all = df[df["date_str"] == prev_date]
@@ -123,7 +105,6 @@ class PublicTWDataFetcher:
             "day_open": float(df[df["date_str"] == today_date]["Open"].iloc[0]) if not df[df["date_str"] == today_date].empty else prev_pm_high
         }
 
-        # 2. 整理今日 5分K
         df_today = df[df["date_str"] == today_date].copy()
         if df_today.empty:
             return stock_info, None
@@ -133,7 +114,6 @@ class PublicTWDataFetcher:
         })
         df_today["time"] = df_today["time_str"]
 
-        # 公開行情外盤成交比估算 (以實體 K 棒開收位置推導買賣力道)
         spread = df_today["high"] - df_today["low"]
         spread = spread.replace(0, 0.01)
         df_today["outside_ratio"] = 0.5 + ((df_today["close"] - df_today["open"]) / spread) * 0.25
@@ -207,7 +187,7 @@ def run_trading_day():
     provider = LiveTWMarketDataProvider()
     today = datetime.datetime.now().strftime("%Y-%m-%d")
 
-    # 1. 載入法人買超共識與前日尾盤撐壓
+    # 1. 載入自選清單與昨日尾盤撐壓
     watchlist = provider.get_watchlist(today)
     print(f"[{today}] 核心自選清單計算完成，共取得 {len(watchlist)} 檔有效標的。")
 
@@ -231,8 +211,19 @@ def run_trading_day():
             msg = format_entry_signal(signal)
             send_telegram_message(msg)
 
+    # 若今日無觸發訊號，主動發送日誌推播通知
     if signals_triggered == 0:
-        print("盤中掃描完成：目前無標的完全符合『強強開盤 + 底底高 + 布林發散』進場標準（嚴守紀律，不隨意出手）。")
+        scan_msg = (
+            f"🔍 *【台股當沖策略監控日報】*\\n"
+            f"📅 日期：`{today}`\\n"
+            f"━━━━━━━━━━━━━━━━━━\\n"
+            f"📊 今日監控標的：共 `{len(watchlist)}` 檔（欣興、技嘉、聯發科等）\\n"
+            f"🛡️ 掃描結果：*今日無標的完全符合進場標準*\\n"
+            f"──────────────────\\n"
+            f"💡 *紀律核心*：未見『強強開盤 + 底底高 + 布林開口』前不盲目追價，嚴守空手觀望紀律！"
+        )
+        send_telegram_message(scan_msg)
+        print("盤中掃描完成：已發送『空手觀望』推播戰報至 Telegram。")
 
     # 3. 盤後自動復盤與戰報統計
     print("--- 執行盤後數據收集與復盤分析 ---")
