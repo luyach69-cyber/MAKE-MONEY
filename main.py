@@ -1,7 +1,7 @@
 """
-main.py - 公開資料全自動當沖選股、即時推播與盤後復盤系統 (升級版)
+main.py - 公開資料全自動當沖選股、即時推播與盤後復盤系統 (正式升級版)
 整合來源：
-1. 證券交易所 (TWSE) / 櫃買中心 (TPEx) 公開 API：盤前自動獲取成交量放大、高週轉、外資投信共識名單。
+1. 證券交易所 (TWSE) 公開資料：盤前自動獲取外資與投信同步買超共識名單。
 2. Yahoo Finance (yfinance)：自動計算前一日 12:00~13:30 尾盤高低點 (支撐/壓力線) 與 5分K 走勢。
 3. 策略引擎 (strategy_engine.py)：開盤勢法 (強強開盤)、底底高、布林通道發散與大單動能檢驗。
 4. 推播與復盤 (notifier.py / review_analyzer.py)：即時 Telegram 訊號發送與盤後勝率統計。
@@ -44,7 +44,6 @@ class PublicTWDataFetcher:
             rows = data["data"]
             df = pd.DataFrame(rows, columns=fields)
             
-            # 欄位清理
             foreign_col = [c for c in df.columns if "外陸資" in c and "自營商" not in c][0]
             trust_col = [c for c in df.columns if "投信" in c and "買賣超" in c][0]
             
@@ -60,11 +59,10 @@ class PublicTWDataFetcher:
             for _, r in df_sorted.iterrows():
                 code = str(r["證券代號"]).strip()
                 name = str(r["證券名稱"]).strip()
-                # 排除 ETF / 權證 / 特殊股 (長度非 4 碼者)
                 if len(code) == 4 and code.isdigit():
                     consensus_stocks.append({"stock_id": code, "stock_name": name})
         except Exception as e:
-            print(f"[警告] 抓取三大法人公開資料失敗: {e}")
+            print(f"[提示] 擷取證交所法人買賣超資料略過或失敗: {e}")
             
         return consensus_stocks
 
@@ -73,9 +71,8 @@ class PublicTWDataFetcher:
         """
         透過 yfinance 抓取最近 5 天的 5分K 資料：
         1. 計算前一日 12:00 ~ 13:30 尾盤高點 (壓力) 與低點 (支撐)
-        2. 取得今日最新 5分K 進行開盤勢法與技術指標判定
+        2. 取得今日 5分K 進行開盤勢法與技術指標判定
         """
-        # 先試上市 .TW，若空則試上櫃 .TWO
         symbol = f"{stock_id}.TW"
         ticker = yf.Ticker(symbol)
         df = ticker.history(period="5d", interval="5m")
@@ -101,7 +98,7 @@ class PublicTWDataFetcher:
         prev_date = all_dates[-2]
         today_date = all_dates[-1]
 
-        # 1. 抓取昨日 12:00 ~ 13:30 尾盤 K 線
+        # 1. 篩選昨日 12:00 ~ 13:30 尾盤區間計算撐壓
         df_prev_pm = df[(df["date_str"] == prev_date) & (df["time_str"] >= "12:00") & (df["time_str"] <= "13:30")]
         if df_prev_pm.empty:
             df_prev_all = df[df["date_str"] == prev_date]
@@ -130,7 +127,7 @@ class PublicTWDataFetcher:
         })
         df_today["time"] = df_today["time_str"]
 
-        # 公開行情外盤成交比估算 (若無逐筆大單，以高低檔實體棒線位置與振幅推導)
+        # 公開行情外盤成交比估算 (以實體 K 棒開收位置推導買賣力道)
         spread = df_today["high"] - df_today["low"]
         spread = spread.replace(0, 0.01)
         df_today["outside_ratio"] = 0.5 + ((df_today["close"] - df_today["open"]) / spread) * 0.25
@@ -143,7 +140,6 @@ class LiveTWMarketDataProvider:
     """公開資料整合行情提供者"""
 
     def __init__(self, fallback_stocks=None):
-        # 內建預設核心關注權值/動能強勢標的 (若盤前爬蟲受阻時無縫備援)
         self.default_stocks = fallback_stocks or [
             {"stock_id": "3037", "stock_name": "欣興"},
             {"stock_id": "2376", "stock_name": "技嘉"},
@@ -161,7 +157,6 @@ class LiveTWMarketDataProvider:
         print("正在自證交所公開資料擷取三大法人買賣超共識名單...")
         consensus = PublicTWDataFetcher.get_twse_institutional_consensus(top_n=20)
         
-        # 若抓到法人清單則以法人共識為主，並補上預設核心股
         combined = []
         seen = set()
         for s in (consensus + self.default_stocks):
@@ -170,8 +165,8 @@ class LiveTWMarketDataProvider:
                 combined.append(s)
         
         watchlist = []
-        print(f"篩選完成，正在計算 {len(combined)} 檔標的之前日尾盤撐壓線 (12:00~13:30)...")
-        for s in combined[:15]:  # 控制每次掃描 15 檔以內，確保穩定不超載
+        print(f"篩選完成，正在計算標的之前日尾盤撐壓線 (12:00~13:30)...")
+        for s in combined[:15]:
             info, df_today = PublicTWDataFetcher.get_stock_levels_and_5m(s["stock_id"], s["stock_name"], trade_date)
             if info and df_today is not None and not df_today.empty:
                 self.cached_info[s["stock_id"]] = info
@@ -196,9 +191,7 @@ class LiveTWMarketDataProvider:
                     "tp_time": "10:00",
                     "sl_time": "13:00"
                 }
-        return {
-            "high": 0.0, "low": 0.0, "close": 0.0, "tp_time": "13:30", "sl_time": "13:30"
-        }
+        return {"high": 0.0, "low": 0.0, "close": 0.0, "tp_time": "13:30", "sl_time": "13:30"}
 
 def run_trading_day():
     print("==================================================")
@@ -208,7 +201,7 @@ def run_trading_day():
     provider = LiveTWMarketDataProvider()
     today = datetime.datetime.now().strftime("%Y-%m-%d")
 
-    # 1. 盤前自選核心池載入 (證交所法人買超共識 + 前日尾盤撐壓)
+    # 1. 載入法人買超共識與前日尾盤撐壓
     watchlist = provider.get_watchlist(today)
     print(f"[{today}] 核心自選清單計算完成，共取得 {len(watchlist)} 檔有效標的。")
 
@@ -217,8 +210,7 @@ def run_trading_day():
         return
 
     # 2. 盤中即時掃描與開盤勢法表態判斷
-    print("
---- 開始執行開盤勢法與 5分K 策略掃描 ---")
+    print("--- 開始執行開盤勢法與 5分K 策略掃描 ---")
     signals_triggered = 0
     for stock in watchlist:
         df_5min = provider.get_5min_bars(stock["stock_id"])
@@ -237,8 +229,7 @@ def run_trading_day():
         print("盤中掃描完成：目前無標的完全符合『強強開盤 + 底底高 + 布林發散』進場標準（嚴守紀律，不隨意出手）。")
 
     # 3. 盤後自動復盤與戰報統計
-    print("
---- 執行盤後數據收集與復盤分析 ---")
+    print("--- 執行盤後數據收集與復盤分析 ---")
     execute_daily_review(today, provider)
     print("=== 今日交易流程與復盤已全數歸檔完畢 ===")
 
