@@ -1,3 +1,9 @@
+def run_trading_day():
+    print("=== 當沖選股推播與自動復盤系統 (公開資料正式版) ===")
+    init_db()
+    
+    # 測試發送一行確認連線
+    send_telegram_message("🔔 系統連線測試：GitHub Actions 已順利啟動並連通 Telegram！")
 """
 main.py - 公開資料全自動當沖選股、即時推播與盤後復盤系統
 整合來源：
