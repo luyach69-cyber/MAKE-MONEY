@@ -1,20 +1,18 @@
 """
-資料庫存取層 (database.py)
-使用 SQLite 紀錄每日推播訊號、成交價位、盤後收盤、盈虧與策略復盤統計
+database.py - SQLite 資料庫操作模組
 """
 import sqlite3
-from datetime import datetime
+from config import DB_PATH
 
-def get_connection(db_path="trading_records.db"):
+def get_connection(db_path=DB_PATH):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
-def init_db(db_path="trading_records.db"):
+def init_db(db_path=DB_PATH):
+    """初始化交易記錄與復盤資料表"""
     conn = get_connection(db_path)
     cursor = conn.cursor()
-    
-    # 建立訊號與交易記錄表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS signal_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,8 +29,6 @@ def init_db(db_path="trading_records.db"):
         bband_status TEXT,
         buyer_power_ratio REAL,
         outside_ratio REAL,
-        
-        -- 盤後復盤更新欄位
         high_price_post REAL,
         low_price_post REAL,
         close_price_post REAL,
@@ -45,8 +41,6 @@ def init_db(db_path="trading_records.db"):
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
-    
-    # 建立每日績效統計表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS daily_reviews (
         trade_date TEXT PRIMARY KEY,
@@ -62,7 +56,8 @@ def init_db(db_path="trading_records.db"):
     conn.commit()
     conn.close()
 
-def insert_signal(signal_data, db_path="trading_records.db"):
+def insert_signal(sig: dict, db_path=DB_PATH) -> int:
+    """寫入即時觸發訊號"""
     conn = get_connection(db_path)
     cursor = conn.cursor()
     cursor.execute("""
@@ -72,19 +67,10 @@ def insert_signal(signal_data, db_path="trading_records.db"):
         open_pattern, bband_status, buyer_power_ratio, outside_ratio
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        signal_data['trade_date'],
-        signal_data['stock_id'],
-        signal_data['stock_name'],
-        signal_data['signal_time'],
-        signal_data['strategy_type'],
-        signal_data['entry_reason'],
-        signal_data['suggested_entry_price'],
-        signal_data['take_profit_price'],
-        signal_data['stop_loss_price'],
-        signal_data.get('open_pattern', ''),
-        signal_data.get('bband_status', ''),
-        signal_data.get('buyer_power_ratio', 0.0),
-        signal_data.get('outside_ratio', 0.0)
+        sig['trade_date'], sig['stock_id'], sig['stock_name'], sig['signal_time'],
+        sig['strategy_type'], sig['entry_reason'], sig['suggested_entry_price'],
+        sig['take_profit_price'], sig['stop_loss_price'], sig.get('open_pattern', ''),
+        sig.get('bband_status', ''), sig.get('buyer_power_ratio', 0.0), sig.get('outside_ratio', 0.0)
     ))
     conn.commit()
     sig_id = cursor.lastrowid
