@@ -1,5 +1,5 @@
 """
-main.py - 公開資料全自動當沖選股、即時推播與盤後復盤系統 (含每日運作通知版)
+main.py - 公開資料全自動當沖選股、即時推播與盤後復盤系統 (修復版)
 """
 
 import time
@@ -59,20 +59,29 @@ class PublicTWDataFetcher:
 
     @staticmethod
     def get_stock_levels_and_5m(stock_id: str, stock_name: str, trade_date: str):
-        # 上櫃代碼清單直接以 .TWO 抓取，其餘先試 .TW
-        otc_stocks = ["6274", "3450", "3533"]
-        symbol = f"{stock_id}.TWO" if stock_id in otc_stocks else f"{stock_id}.TW"
-        
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period="5d", interval="5m")
-        if df.empty and not symbol.endswith(".TWO"):
-            ticker = yf.Ticker(f"{stock_id}.TWO")
-            df = ticker.history(period="5d", interval="5m")
-            if df.empty:
-                return None, None
+        # 優先嘗試 .TW，失敗或空值再嘗試 .TWO
+        df = pd.DataFrame()
+        for suffix in [".TW", ".TWO"]:
+            symbol = f"{stock_id}{suffix}"
+            ticker = yf.Ticker(symbol)
+            try:
+                temp_df = ticker.history(period="5d", interval="5m")
+                if not temp_df.empty:
+                    df = temp_df
+                    break
+            except Exception:
+                continue
+
+        if df.empty:
+            return None, None
+
+        # 核心防呆：強制將 Index 轉為 DatetimeIndex，避免 AttributeError
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
 
         try:
-            df.index = df.index.tz_convert("Asia/Taipei")
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert("Asia/Taipei")
         except Exception:
             pass
 
@@ -211,15 +220,15 @@ def run_trading_day():
             msg = format_entry_signal(signal)
             send_telegram_message(msg)
 
-    # 若今日無觸發訊號，主動發送日誌推播通知
+    # 若今日無觸發訊號，發送空手日報至 Telegram
     if signals_triggered == 0:
         scan_msg = (
-            f"🔍 *【台股當沖策略監控日報】*\\n"
-            f"📅 日期：`{today}`\\n"
-            f"━━━━━━━━━━━━━━━━━━\\n"
-            f"📊 今日監控標的：共 `{len(watchlist)}` 檔（欣興、技嘉、聯發科等）\\n"
-            f"🛡️ 掃描結果：*今日無標的完全符合進場標準*\\n"
-            f"──────────────────\\n"
+            f"🔍 *【台股當沖策略監控日報】*\n"
+            f"📅 日期：`{today}`\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📊 今日監控標的：共 `{len(watchlist)}` 檔（欣興、技嘉、聯發科等）\n"
+            f"🛡️ 掃描結果：*今日無標的完全符合進場標準*\n"
+            f"──────────────────\n"
             f"💡 *紀律核心*：未見『強強開盤 + 底底高 + 布林開口』前不盲目追價，嚴守空手觀望紀律！"
         )
         send_telegram_message(scan_msg)
