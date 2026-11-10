@@ -1,52 +1,42 @@
-name: Manual Trading Signal Monitor
+name: Intraday Stock Scanner & Post Review
 
 on:
-  schedule:
-    # 台灣時區 (UTC+8) 週一至週五：
-    # 早盤 09:20, 09:40, 10:00, 10:20 (UTC 01:20, 01:40, 02:00, 02:20)
-    - cron: '20,40 1 * * 1-5'
-    - cron: '0,20 2 * * 1-5'
-    # 午盤突破 11:20, 11:50, 12:20 (UTC 03:20, 03:50, 04:20)
-    - cron: '20,50 3 * * 1-5'
-    - cron: '20 4 * * 1-5'
-    # 收盤歸檔與月底結算 13:40 (UTC 05:40)
-    - cron: '40 5 * * 1-5'
+  # 支援手動立即測試執行
   workflow_dispatch:
+  # 定時排程 (UTC 時間，台灣時間需 -8 小時)
+  schedule:
+    # 台灣時間 09:05 (UTC 01:05) 執行開盤至盤中主波段掃描
+    - cron: '5 1 * * 1-5'
+    # 台灣時間 13:35 (UTC 05:35) 執行盤後自動復盤與戰報推播
+    - cron: '35 5 * * 1-5'
 
 jobs:
-  run-monitor:
+  run-trading-system:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
-      - name: Checkout Code
+      - name: 檢出專案代碼
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: 設定 Python 環境
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install Dependencies
+      - name: 安裝相依套件
         run: |
-          pip install requests pandas python-dateutil pytz
+          pip install pandas numpy requests
 
-      - name: Run Scan & Alert
+      - name: 執行當沖系統
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python main.py
 
-      - name: Commit Historical Records
-        run: |
-          git config --local user.email "bot@action.com"
-          git config --local user.name "SignalBot"
-          git add data/history/*.csv || true
-          if git diff --staged --quiet; then
-            echo "No new signals."
-          else
-            git commit -m "Add manual trading signal log [skip ci]"
-            git push
-          fi
+      - name: 保存 SQLite 復盤資料庫記錄
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading-database
+          path: trading_records.db
+          retention-days: 30
