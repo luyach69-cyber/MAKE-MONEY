@@ -1,5 +1,5 @@
 """
-main.py - 公開資料全自動當沖選股、即時推播與盤後復盤系統 (正式升級版)
+main.py - 公開資料全自動當沖選股、即時推播與盤後復盤系統
 整合來源：
 1. 證券交易所 (TWSE) 公開資料：盤前自動獲取外資與投信同步買超共識名單。
 2. Yahoo Finance (yfinance)：自動計算前一日 12:00~13:30 尾盤高低點 (支撐/壓力線) 與 5分K 走勢。
@@ -50,7 +50,7 @@ class PublicTWDataFetcher:
             df["foreign_buy"] = df[foreign_col].astype(str).str.replace(",", "").astype(float)
             df["trust_buy"] = df[trust_col].astype(str).str.replace(",", "").astype(float)
             
-            # 外資投信同步買超
+            # 外資投信同步買超條件
             cond = (df["foreign_buy"] > 0) & (df["trust_buy"] > 0)
             df_filtered = df[cond].copy()
             df_filtered["total_inst_buy"] = df_filtered["foreign_buy"] + df_filtered["trust_buy"]
