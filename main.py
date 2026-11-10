@@ -110,3 +110,52 @@ def run():
 
 if __name__ == "__main__":
     run()
+import sys
+
+def run_night_watchlist():
+    """專門於晚上執行：產生並推播明日當沖觀察名單與關鍵撐壓"""
+    print("==================================================")
+    print("=== 執行夜間選股：計算明日當沖自選清單與關鍵撐壓 ===")
+    print("==================================================")
+    init_db()
+    provider = LiveTWMarketDataProvider()
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+
+    # 抓取今天最新結算之法人共識與計算今日尾盤 (12:00~13:30) 撐壓
+    watchlist = provider.get_watchlist(today)
+    if not watchlist:
+        print("[提示] 今日無符合之名單。")
+        return
+
+    # 組裝 Telegram 盤前獵殺戰報
+    stock_lines = []
+    for s in watchlist[:15]:
+        vol_tag = "🔥" if s.get("is_vol_expanding") else "🔹"
+        stock_lines.append(
+            f"{vol_tag} *{s['stock_id']} {s['stock_name']}*\n"
+            f"   • 明日關鍵壓力：`{s['prev_pm_high']:.1f}` 元\n"
+            f"   • 明日防守支撐：`{s['prev_pm_low']:.1f}` 元"
+        )
+    
+    stocks_detail = "\n".join(stock_lines)
+    night_msg = (
+        f"📋 *【明日當沖獵殺・核心自選觀察清單】* 📋\n"
+        f"📅 統計基準日：`{today}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 *法人共識＋動能標的*（共 `{len(watchlist[:15])}` 檔）：\n\n"
+        f"{stocks_detail}\n"
+        f"──────────────────\n"
+        f"💡 *明晨作戰守則*：\n"
+        f"1. 09:00 開盤第一根 5 分 K 帶量衝破壓力線 ➜ 鎖定【強強開盤】\n"
+        f"2. 洗盤不破前低 (底底高) 且布林開口張開時 ➜ 系統將自動推播進場！\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+    send_telegram_message(night_msg)
+    print("夜間自選名單已成功推播至 Telegram！")
+
+if __name__ == "__main__":
+    # 如果執行時帶入 --night 參數，就執行夜間清單推播；否則執行正常盤中監控
+    if len(sys.argv) > 1 and sys.argv[1] == "--night":
+        run_night_watchlist()
+    else:
+        run_trading_day()
