@@ -1,42 +1,44 @@
-name: Intraday Stock Scanner & Post Review
+name: run-monitor
 
 on:
-  # 支援手動立即測試執行
   workflow_dispatch:
-  # 定時排程 (UTC 時間，台灣時間需 -8 小時)
   schedule:
-    # 台灣時間 09:05 (UTC 01:05) 執行開盤至盤中主波段掃描
-    - cron: '5 1 * * 1-5'
-    # 台灣時間 13:35 (UTC 05:35) 執行盤後自動復盤與戰報推播
+    # 台灣時間 09:15 (UTC 01:15) 盤中主波段發動前掃描
+    - cron: '15 1 * * 1-5'
+    # 台灣時間 13:35 (UTC 05:35) 盤後自動復盤
     - cron: '35 5 * * 1-5'
 
 jobs:
-  run-trading-system:
+  run-monitor:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - name: 檢出專案代碼
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 設定 Python 環境
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: 安裝相依套件
+      - name: Install Dependencies
         run: |
-          pip install pandas numpy requests
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests yfinance
 
-      - name: 執行當沖系統
+      - name: Run Stock Breakout Engine
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python main.py
 
-      - name: 保存 SQLite 復盤資料庫記錄
-        uses: actions/upload-artifact@v4
-        with:
-          name: trading-database
-          path: trading_records.db
-          retention-days: 30
+      - name: Commit and Push Data
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add trading_records.db || true
+          git commit -m "Auto update trading records database [skip ci]" || true
+          git push || true
