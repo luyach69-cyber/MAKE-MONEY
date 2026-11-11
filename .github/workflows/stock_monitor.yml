@@ -2,15 +2,23 @@ name: run-monitor
 
 on:
   workflow_dispatch:
+    inputs:
+      run_mode:
+        description: '執行模式選擇'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - night
+          - intraday
   schedule:
-    # 1. 盤中主動監控：台灣時間 09:05 ~ 10:25 每 10 分鐘掃描一次
+    # 盤中監控：台灣時間 09:05 ~ 10:25 每 10 分鐘 (UTC 01:05 ~ 02:25)
     - cron: '5,15,25,35,45,55 1 * * 1-5'
     - cron: '5,15,25 2 * * 1-5'
-
-    # 2. 盤後自動復盤：台灣時間 13:35 (UTC 05:35)
+    # 盤後復盤：台灣時間 13:35 (UTC 05:35)
     - cron: '35 5 * * 1-5'
-
-    # 3. 夜間先行推播：台灣時間週日至週四 20:00 (UTC 12:00) 產出明日清單
+    # 夜間預選名單：台灣時間週日至週四 20:00 (UTC 12:00)
     - cron: '0 12 * * 0-4'
 
 jobs:
@@ -33,16 +41,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy requests yfinance
 
-      - name: Run Stock Breakout Engine
+      - name: Run Stock Engine
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          INPUT_MODE: ${{ inputs.run_mode }}
         run: |
-          # 判斷如果是 UTC 12:00 (台灣時間 20:00)，就跑夜間清單推播
           CURRENT_HOUR=$(date -u +%H)
-          if [ "$CURRENT_HOUR" -eq 12 ]; then
+          echo "當前 UTC 小時: $CURRENT_HOUR, 選擇模式: $INPUT_MODE"
+          
+          if [ "$INPUT_MODE" = "night" ] || [ "$CURRENT_HOUR" -eq 12 ]; then
+            echo ">>> 啟動夜間預選名單推播模式 (--night)"
             python main.py --night
           else
+            echo ">>> 啟動常規盤中策略掃描模式"
             python main.py
           fi
 
