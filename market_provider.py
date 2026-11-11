@@ -1,10 +1,10 @@
 """
-market_provider.py - 台灣證券市場公開數據擷取模組 (當沖高動能標的過濾升級版)
-核心升級：
-1. 嚴格剔除 ETF (00 開頭)、金融股 (28 開頭)、塑化水泥鋼鐵等低振幅傳產 (11, 13, 14, 20, 99 開頭)。
-2. 保留電子、半導體、AI 伺服器、PCB、CPO 等高振幅、高週轉當沖強勢標的。
-3. 證交所 T-1 外資與投信同步買超精確匹配。
-4. Asia/Taipei 台灣時區精確切片前日 12:00~13:30 尾盤高低撐壓，防止單點重疊。
+market_provider.py - 台灣證券市場公開數據擷取模組
+過濾規則：
+1. 僅排除 ETF (代碼為 00 開頭)。
+2. 保留所有 4 碼純數字之普通個股 (包含電子、金融、傳產權值股等)。
+3. 精確解析證交所 T-1 外陸資與投信同步買超資料。
+4. Asia/Taipei 時區切片前日 12:00~13:30 尾盤高低撐壓。
 """
 import datetime
 import requests
@@ -32,7 +32,7 @@ class PublicTWDataFetcher:
     def get_twse_institutional_consensus(trade_date_str: str = None, top_n: int = 20):
         """
         向證交所公開端點請求『前一交易日 (T-1)』三大法人買賣超日報
-        精確篩選外陸資與投信同步大買的高動能當沖個股
+        僅排除 00 開頭的 ETF，其餘外資與投信同步大買之普通股全數保留
         """
         if not trade_date_str:
             trade_date_str = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -60,7 +60,7 @@ class PublicTWDataFetcher:
             rows = data["data"]
             df = pd.DataFrame(rows, columns=fields)
 
-            # 定位「外陸資買賣超股數(不含外資自營商)」與「投信買賣超股數」
+            # 定位外資與投信買賣超欄位
             foreign_col = None
             trust_col = None
             for c in df.columns:
@@ -73,48 +73,31 @@ class PublicTWDataFetcher:
                 df["foreign_buy"] = df[foreign_col].astype(str).str.replace(",", "").astype(float)
                 df["trust_buy"] = df[trust_col].astype(str).str.replace(",", "").astype(float)
 
-                # 外資與投信同步買超條件
+                # 外資與投信同步買超
                 cond = (df["foreign_buy"] > 0) & (df["trust_buy"] > 0)
                 df_filtered = df[cond].copy()
                 df_filtered["total_inst_buy"] = df_filtered["foreign_buy"] + df_filtered["trust_buy"]
-                # 排序取前 60 檔進行品質與屬性過濾
-                df_sorted = df_filtered.sort_values(by="total_inst_buy", ascending=False).head(60)
+                df_sorted = df_filtered.sort_values(by="total_inst_buy", ascending=False).head(50)
 
                 for _, r in df_sorted.iterrows():
                     code = str(r["證券代號"]).strip()
                     name = str(r["證券名稱"]).strip()
 
-                    # -------------------------------------------------------------
-                    # 核心過濾器：當沖標的屬性淨化
-                    # -------------------------------------------------------------
-                    # 1. 必須是 4 碼純數字普通股
+                    # 1. 必須是 4 碼純數字
                     if not (len(code) == 4 and code.isdigit()):
                         continue
 
-                    # 2. 嚴格剔除 ETF (00 開頭，如 0050、0052、0056 等)
+                    # 2. 僅排除 00 開頭的 ETF (如 0050, 0052, 0056 等)
                     if code.startswith("00"):
                         continue
 
-                    # 3. 排除金融與金控保險族群 (28 開頭，每日波幅多低於 1.5%，不適配當沖)
-                    if code.startswith("28"):
-                        continue
-
-                    # 4. 排除低動能與低週轉之傳產板塊：
-                    # 11 (水泥), 13 (塑膠), 14 (紡織), 20 (鋼鐵), 99 (其他/營建/工程)
-                    if code.startswith(("11", "13", "14", "20", "99")):
-                        continue
-
-                    # 5. 名稱排除特定非交易標的
-                    if any(kw in name for kw in ["DR", "特", "KY-存託"]):
-                        continue
-
+                    # 其餘個股 (包含 1303 南亞, 2886 兆豐金, 1802 台玻, 2317 鴻海等) 全數保留
                     consensus_stocks.append({"stock_id": code, "stock_name": name})
 
-                    # 取足目標標的數即停止
                     if len(consensus_stocks) >= top_n:
                         break
 
-                print(f"✓ 成功抓取前一交易日 ({query_date}) 外資投信合買【高動能當沖股】共 {len(consensus_stocks)} 檔！")
+                print(f"✓ 成功抓取前一交易日 ({query_date}) 外資投信合買共識股共 {len(consensus_stocks)} 檔！")
             else:
                 print(f"[警告] 找不到對應的外資或投信欄位，現有欄位清單為：{fields}")
 
@@ -127,9 +110,9 @@ class PublicTWDataFetcher:
     def get_stock_levels_and_5m(stock_id: str, stock_name: str, trade_date: str):
         """
         透過 yfinance 抓取最近 5 天 5分K：
-        1. 關閉權息還原，確保撮合價精準真實
-        2. 時區精確對齊 Asia/Taipei，完整切出前日 12:00~13:30 尾盤撐壓
-        3. 整理今日 5分K 供開盤勢法策略引擎判定
+        1. 關閉除權息調整，取得真實交易價格
+        2. 嚴格對齊 Asia/Taipei 時區
+        3. 切出前日 12:00~13:30 尾盤高低撐壓
         """
         df = pd.DataFrame()
         for suffix in [".TW", ".TWO"]:
@@ -174,9 +157,7 @@ class PublicTWDataFetcher:
         df_prev_all = df[df["date_str"] == prev_date]
         df_today_all = df[df["date_str"] == today_date]
 
-        # ---------------------------------------------------------
-        # 前日 12:00 ~ 13:30 尾盤區間精確切片 (防單筆重疊)
-        # ---------------------------------------------------------
+        # 前日 12:00 ~ 13:30 尾盤區間切片
         df_prev_pm = df_prev_all[(df_prev_all["time_str"] >= "12:00") & (df_prev_all["time_str"] <= "13:35")]
 
         if len(df_prev_pm) < 3:
@@ -189,13 +170,13 @@ class PublicTWDataFetcher:
             prev_pm_high = float(df_prev_all["High"].max())
             prev_pm_low = float(df_prev_all["Low"].min())
 
-        # 防呆：若完全平盤導致壓力等於支撐，自動給予合理保護價差
+        # 走平防呆價差
         if prev_pm_high == prev_pm_low:
             spread_buffer = max(prev_pm_high * 0.005, 0.5)
             prev_pm_high += spread_buffer
             prev_pm_low -= spread_buffer
 
-        # 量能放大檢驗 (第一根 5 分 K 爆量 1.5 倍以上)
+        # 量能放大檢驗
         is_vol_expanding = False
         if not df_prev_all.empty and not df_today_all.empty:
             first_bar_vol = df_today_all["Volume"].iloc[0] if len(df_today_all) > 0 else 0
